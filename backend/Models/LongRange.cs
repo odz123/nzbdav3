@@ -1,18 +1,31 @@
-﻿namespace NzbWebDAV.Models;
+﻿using System.Runtime.CompilerServices;
 
-public record LongRange(long StartInclusive, long EndExclusive)
+namespace NzbWebDAV.Models;
+
+/// <summary>
+/// A range of long values. Uses readonly record struct for stack allocation instead of heap.
+/// </summary>
+public readonly record struct LongRange(long StartInclusive, long EndExclusive)
 {
-    public long Count => EndExclusive - StartInclusive;
+    public long Count
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => EndExclusive - StartInclusive;
+    }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool Contains(long value) =>
         value >= StartInclusive && value < EndExclusive;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool Contains(LongRange range) =>
         range.StartInclusive >= StartInclusive && range.EndExclusive <= EndExclusive;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsContainedWithin(LongRange range) =>
         range.Contains(this);
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static LongRange FromStartAndSize(long startInclusive, long size) =>
         new(startInclusive, startInclusive + size);
 }

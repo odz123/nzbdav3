@@ -11,6 +11,8 @@ using NzbWebDAV.Utils;
 using NzbWebDAV.Websocket;
 using Serilog;
 
+// Note: Microsoft.EntityFrameworkCore is still needed for GetHealthCheckQueueItems queries
+
 namespace NzbWebDAV.Services;
 
 /// <summary>
@@ -189,17 +191,15 @@ public class HealthCheckService
 
         if (davItem.Type == DavItem.ItemType.RarFile)
         {
-            var rarFile = await dbClient.Ctx.RarFiles
-                .Where(x => x.Id == davItem.Id)
-                .FirstOrDefaultAsync(ct).ConfigureAwait(false);
+            // Use compiled query from DavDatabaseClient
+            var rarFile = await dbClient.GetRarFileAsync(davItem.Id, ct).ConfigureAwait(false);
             return rarFile?.RarParts?.SelectMany(x => x.SegmentIds)?.ToList() ?? [];
         }
 
         if (davItem.Type == DavItem.ItemType.MultipartFile)
         {
-            var multipartFile = await dbClient.Ctx.MultipartFiles
-                .Where(x => x.Id == davItem.Id)
-                .FirstOrDefaultAsync(ct).ConfigureAwait(false);
+            // Use compiled query from DavDatabaseClient
+            var multipartFile = await dbClient.GetMultipartFileAsync(davItem.Id, ct).ConfigureAwait(false);
             return multipartFile?.Metadata?.FileParts?.SelectMany(x => x.SegmentIds)?.ToList() ?? [];
         }
 

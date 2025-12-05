@@ -34,20 +34,26 @@ public class MultipartFileStream : Stream
         return ReadAsync(buffer, offset, count).GetAwaiter().GetResult();
     }
 
-    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
-        if (count == 0) return 0;
+        return ReadAsyncCore(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+    }
+
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        return ReadAsyncCore(buffer, cancellationToken);
+    }
+
+    private async ValueTask<int> ReadAsyncCore(Memory<byte> buffer, CancellationToken cancellationToken)
+    {
+        if (buffer.Length == 0) return 0;
         while (_position < Length && !cancellationToken.IsCancellationRequested)
         {
             // If we haven't read the first stream, read it.
             _currentStream ??= GetCurrentStream();
 
             // read from our current stream
-            var readCount = await _currentStream.ReadAsync
-            (
-                buffer.AsMemory(offset, count),
-                cancellationToken
-            ).ConfigureAwait(false);
+            var readCount = await _currentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
             _position += readCount;
             if (readCount > 0) return readCount;
 
@@ -77,9 +83,13 @@ public class MultipartFileStream : Stream
 
     public override long Seek(long offset, SeekOrigin origin)
     {
-        var absoluteOffset = origin == SeekOrigin.Begin ? offset
-            : origin == SeekOrigin.Current ? _position + offset
-            : throw new InvalidOperationException("SeekOrigin must be Begin or Current.");
+        var absoluteOffset = origin switch
+        {
+            SeekOrigin.Begin => offset,
+            SeekOrigin.Current => _position + offset,
+            SeekOrigin.End => Length + offset,
+            _ => throw new ArgumentOutOfRangeException(nameof(origin))
+        };
         if (_position == absoluteOffset) return _position;
         _position = absoluteOffset;
         _currentStream?.Dispose();

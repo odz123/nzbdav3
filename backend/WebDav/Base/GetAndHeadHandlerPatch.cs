@@ -1,4 +1,5 @@
-﻿using Microsoft.AspNetCore.Http;
+﻿using System.Buffers;
+using Microsoft.AspNetCore.Http;
 using NWebDav.Server;
 using NWebDav.Server.Handlers;
 using NWebDav.Server.Helpers;
@@ -152,7 +153,9 @@ public class GetAndHeadHandlerPatch : IRequestHandler
         return true;
     }
 
-    private async Task CopyToAsync(Stream src, Stream dest, long start, long? end, CancellationToken cancellationToken)
+    private const int CopyBufferSize = 64 * 1024;
+
+    private static async Task CopyToAsync(Stream src, Stream dest, long start, long? end, CancellationToken cancellationToken)
     {
         // Skip to the first offset
         if (start > 0)
@@ -160,32 +163,38 @@ public class GetAndHeadHandlerPatch : IRequestHandler
             // We prefer seeking instead of draining data
             if (!src.CanSeek)
                 throw new IOException("Cannot use range, because the source stream isn't seekable");
-            
+
             src.Seek(start, SeekOrigin.Begin);
         }
 
         // Determine the number of bytes to read
         var bytesToRead = end - start + 1 ?? long.MaxValue;
 
-        // Read in 64KB blocks
-        var buffer = new byte[64 * 1024];
-
-        // Copy, until we don't get any data anymore
-        while (bytesToRead > 0)
+        // Use ArrayPool to avoid allocations on every request
+        var buffer = ArrayPool<byte>.Shared.Rent(CopyBufferSize);
+        try
         {
-            // Read the requested bytes into memory
-            var requestedBytes = (int)Math.Min(bytesToRead, buffer.Length);
-            var bytesRead = await src.ReadAsync(buffer, 0, requestedBytes, cancellationToken).ConfigureAwait(false);
+            // Copy, until we don't get any data anymore
+            while (bytesToRead > 0)
+            {
+                // Read the requested bytes into memory
+                var requestedBytes = (int)Math.Min(bytesToRead, CopyBufferSize);
+                var bytesRead = await src.ReadAsync(buffer.AsMemory(0, requestedBytes), cancellationToken).ConfigureAwait(false);
 
-            // We're done, if we cannot read any data anymore
-            if (bytesRead == 0)
-                return;
-            
-            // Write the data to the destination stream
-            await dest.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false);
+                // We're done, if we cannot read any data anymore
+                if (bytesRead == 0)
+                    return;
 
-            // Decrement the number of bytes left to read
-            bytesToRead -= bytesRead;
+                // Write the data to the destination stream
+                await dest.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken).ConfigureAwait(false);
+
+                // Decrement the number of bytes left to read
+                bytesToRead -= bytesRead;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 }

@@ -6,17 +6,31 @@ using NzbWebDAV.Database.Models;
 
 namespace NzbWebDAV.Database;
 
-public sealed class DavDatabaseContext() : DbContext(Options.Value)
+public sealed class DavDatabaseContext : DbContext
 {
     public static string ConfigPath => Environment.GetEnvironmentVariable("CONFIG_PATH") ?? "/config";
     public static string DatabaseFilePath => Path.Join(ConfigPath, "db.sqlite");
 
+    // Shared interceptor instance to avoid allocations
+    private static readonly SqliteForeignKeyEnabler SharedInterceptor = new();
+
+    /// <summary>
+    /// Returns the shared interceptor for use with DbContext pooling.
+    /// </summary>
+    public static SqliteForeignKeyEnabler GetSharedInterceptor() => SharedInterceptor;
+
     private static readonly Lazy<DbContextOptions<DavDatabaseContext>> Options = new(
         () => new DbContextOptionsBuilder<DavDatabaseContext>()
             .UseSqlite($"Data Source={DatabaseFilePath}")
-            .AddInterceptors(new SqliteForeignKeyEnabler())
+            .AddInterceptors(SharedInterceptor)
             .Options
     );
+
+    // Default constructor for non-pooled usage
+    public DavDatabaseContext() : base(Options.Value) { }
+
+    // Constructor for DbContext pooling
+    public DavDatabaseContext(DbContextOptions<DavDatabaseContext> options) : base(options) { }
 
     // database sets
     public DbSet<Account> Accounts => Set<Account>();

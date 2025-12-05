@@ -92,5 +92,8 @@ public static class InterpolationSearch
         }
     }
 
-    public record Result(int FoundIndex, LongRange FoundByteRange);
+    /// <summary>
+    /// Result of an interpolation search. Uses readonly record struct to avoid heap allocations.
+    /// </summary>
+    public readonly record struct Result(int FoundIndex, LongRange FoundByteRange);
 }
