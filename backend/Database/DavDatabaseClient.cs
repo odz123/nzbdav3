@@ -60,6 +60,33 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
     private static readonly Func<DavDatabaseContext, Task<long?>> GetTotalFileSizeQuery =
         EF.CompileAsyncQuery((DavDatabaseContext ctx) => ctx.Items.Sum(x => x.FileSize));
 
+    // Queue top item compiled query - optimized for hot path
+    private static readonly Func<DavDatabaseContext, DateTime, Task<QueueItem?>> GetTopQueueItemQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, DateTime nowTime) =>
+            ctx.QueueItems
+                .Where(q => q.PauseUntil == null || nowTime >= q.PauseUntil)
+                .OrderByDescending(q => q.Priority)
+                .ThenBy(q => q.CreatedAt)
+                .FirstOrDefault());
+
+    // History compiled queries
+    private static readonly Func<DavDatabaseContext, Task<int>> GetHistoryItemsCountQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx) => ctx.HistoryItems.Count());
+
+    private static readonly Func<DavDatabaseContext, string, Task<int>> GetHistoryItemsCountByCategoryQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, string category) =>
+            ctx.HistoryItems.Count(h => h.Category == category));
+
+    // Directory children count query
+    private static readonly Func<DavDatabaseContext, Guid, Task<int>> GetDirectoryChildrenCountQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid dirId) =>
+            ctx.Items.Count(x => x.ParentId == dirId));
+
+    // File existence check query
+    private static readonly Func<DavDatabaseContext, Guid, Task<bool>> FileExistsQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid id) =>
+            ctx.Items.Any(i => i.Id == id));
+
     #endregion
 
     // file
@@ -153,20 +180,46 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
     }
 
     // queue
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public async Task<(QueueItem? queueItem, QueueNzbContents? queueNzbContents)> GetTopQueueItem
     (
         CancellationToken ct = default
     )
     {
         var nowTime = DateTime.Now;
-        var queueItem = await Ctx.QueueItems
-            .OrderByDescending(q => q.Priority)
-            .ThenBy(q => q.CreatedAt)
-            .Where(q => q.PauseUntil == null || nowTime >= q.PauseUntil)
-            .FirstOrDefaultAsync(ct).ConfigureAwait(false);
+        var queueItem = await GetTopQueueItemQuery(ctx, nowTime).ConfigureAwait(false);
         if (queueItem == null) return (null, null);
         var queueNzbContents = await GetQueueNzbContentsByIdQuery(ctx, queueItem.Id).ConfigureAwait(false);
         return (queueItem, queueNzbContents);
+    }
+
+    /// <summary>
+    /// Gets the count of children in a directory using compiled query.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Task<int> GetDirectoryChildrenCountAsync(Guid dirId, CancellationToken ct = default)
+    {
+        return GetDirectoryChildrenCountQuery(ctx, dirId);
+    }
+
+    /// <summary>
+    /// Checks if a file exists using compiled query.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Task<bool> FileExistsAsync(Guid id, CancellationToken ct = default)
+    {
+        return FileExistsQuery(ctx, id);
+    }
+
+    /// <summary>
+    /// Gets history items count, optionally by category.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public Task<int> GetHistoryItemsCountAsync(string? category, CancellationToken ct = default)
+    {
+        return category != null
+            ? GetHistoryItemsCountByCategoryQuery(ctx, category)
+            : GetHistoryItemsCountQuery(ctx);
     }
 
     public Task<QueueItem[]> GetQueueItems

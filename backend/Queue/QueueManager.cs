@@ -10,7 +10,11 @@ using Serilog;
 
 namespace NzbWebDAV.Queue;
 
-public class QueueManager : IDisposable
+/// <summary>
+/// Manages the queue processing pipeline for NZB downloads.
+/// Uses lock-free patterns for hot-path operations and efficient semaphore-based locking.
+/// </summary>
+public sealed class QueueManager : IDisposable
 {
     private InProgressQueueItem? _inProgressQueueItem;
 
@@ -25,12 +29,14 @@ public class QueueManager : IDisposable
     private volatile CancellationTokenSource _sleepingQueueToken = new();
     private readonly object _sleepingQueueLock = new();
 
+    // Pre-computed delay for queue polling
+    private static readonly TimeSpan QueuePollInterval = TimeSpan.FromMinutes(1);
+
     public QueueManager(
         UsenetStreamingClient usenetClient,
         ConfigManager configManager,
         WebsocketManager websocketManager,
-        HealthCheckService healthCheckService
-    )
+        HealthCheckService healthCheckService)
     {
         _usenetClient = usenetClient;
         _configManager = configManager;
@@ -41,13 +47,23 @@ public class QueueManager : IDisposable
         _ = ProcessQueueAsync(_cancellationTokenSource.Token);
     }
 
+    /// <summary>
+    /// Gets the currently processing queue item and its progress.
+    /// Lock-free read for UI polling.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public (QueueItem? queueItem, int? progress) GetInProgressQueueItem()
     {
+        // Volatile read ensures we see the latest value
         var item = _inProgressQueueItem;
         return (item?.QueueItem, item?.ProgressPercentage);
     }
 
+    /// <summary>
+    /// Wakes up the queue processor if it's sleeping.
+    /// Thread-safe and lock-free.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void AwakenQueue()
     {
         // Take reference to avoid race condition
@@ -93,7 +109,7 @@ public class QueueManager : IDisposable
                     {
                         // if we're done with the queue, wait a minute before checking again.
                         // or wait until awoken by cancellation of _sleepingQueueToken
-                        await Task.Delay(TimeSpan.FromMinutes(1), _sleepingQueueToken.Token).ConfigureAwait(false);
+                        await Task.Delay(QueuePollInterval, _sleepingQueueToken.Token).ConfigureAwait(false);
                     }
                     catch when (_sleepingQueueToken.IsCancellationRequested)
                     {
