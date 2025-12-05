@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Clients.Usenet.Connections;
@@ -26,7 +27,10 @@ public class HealthCheckService
     private readonly CancellationToken _cancellationToken = SigtermUtil.GetCancellationToken();
 
     // Use ConcurrentDictionary for lock-free reads - much faster than HashSet with lock
-    private ConcurrentDictionary<string, byte> _missingSegmentIds = new();
+    // Pre-allocate with expected capacity to avoid resizing
+    private ConcurrentDictionary<string, byte> _missingSegmentIds = new(
+        concurrencyLevel: Environment.ProcessorCount,
+        capacity: 1024);
 
     public HealthCheckService
     (
@@ -41,9 +45,11 @@ public class HealthCheckService
 
         _configManager.OnConfigChanged += (_, configEventArgs) =>
         {
-            // when usenet host changes, clear the missing segments cache
+            // when usenet host changes, clear the missing segments cache atomically
             if (!configEventArgs.ChangedConfig.ContainsKey("usenet.host")) return;
-            _missingSegmentIds = new ConcurrentDictionary<string, byte>();
+            Interlocked.Exchange(ref _missingSegmentIds, new ConcurrentDictionary<string, byte>(
+                concurrencyLevel: Environment.ProcessorCount,
+                capacity: 1024));
         };
 
         _ = StartMonitoringService();
@@ -348,11 +354,13 @@ public class HealthCheckService
         return result;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void CheckCachedMissingSegmentIds(IEnumerable<string> segmentIds)
     {
         // Lock-free check using ConcurrentDictionary - much faster for reads
+        var cache = _missingSegmentIds; // Local copy for performance
         foreach (var segmentId in segmentIds)
-            if (_missingSegmentIds.ContainsKey(segmentId))
+            if (cache.ContainsKey(segmentId))
                 throw new UsenetArticleNotFoundException(segmentId);
     }
 }

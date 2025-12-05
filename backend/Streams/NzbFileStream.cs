@@ -1,4 +1,5 @@
-﻿using NzbWebDAV.Clients.Usenet;
+﻿using System.Runtime.CompilerServices;
+using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Extensions;
 using NzbWebDAV.Models;
 using NzbWebDAV.Utils;
@@ -16,6 +17,10 @@ public class NzbFileStream(
     private CombinedStream? _innerStream;
     private bool _disposed;
 
+    // Cache segment metadata for fast seeking - avoids network round-trips
+    private readonly LongRange[] _segmentRangeCache = new LongRange[fileSegmentIds.Length];
+    private readonly bool[] _segmentCached = new bool[fileSegmentIds.Length];
+
     public override void Flush()
     {
         _innerStream?.Flush();
@@ -26,6 +31,7 @@ public class NzbFileStream(
         return ReadAsync(buffer, offset, count).GetAwaiter().GetResult();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
         _innerStream ??= await GetFileStream(_position, cancellationToken).ConfigureAwait(false);
@@ -34,6 +40,7 @@ public class NzbFileStream(
         return read;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
         _innerStream ??= await GetFileStream(_position, cancellationToken).ConfigureAwait(false);
@@ -76,10 +83,30 @@ public class NzbFileStream(
 
     public override long Position
     {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => _position;
         set => Seek(value, SeekOrigin.Begin);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private async ValueTask<LongRange> GetSegmentRangeAsync(int index, CancellationToken ct)
+    {
+        // Fast path: check local cache first
+        if (_segmentCached[index])
+        {
+            return _segmentRangeCache[index];
+        }
+
+        // Slow path: fetch from client (which has its own cache)
+        var header = await client.GetSegmentYencHeaderAsync(fileSegmentIds[index], ct).ConfigureAwait(false);
+        var range = new LongRange(header.PartOffset, header.PartOffset + header.PartSize);
+
+        // Cache locally for this stream instance
+        _segmentRangeCache[index] = range;
+        _segmentCached[index] = true;
+
+        return range;
+    }
 
     private async Task<InterpolationSearch.Result> SeekSegment(long byteOffset, CancellationToken ct)
     {
@@ -93,11 +120,7 @@ public class NzbFileStream(
             byteOffset,
             new LongRange(0, fileSegmentIds.Length),
             new LongRange(0, fileSize),
-            async (guess) =>
-            {
-                var header = await client.GetSegmentYencHeaderAsync(fileSegmentIds[guess], ct).ConfigureAwait(false);
-                return new LongRange(header.PartOffset, header.PartOffset + header.PartSize);
-            },
+            async (guess) => await GetSegmentRangeAsync(guess, ct).ConfigureAwait(false),
             ct
         ).ConfigureAwait(false);
     }
@@ -115,6 +138,7 @@ public class NzbFileStream(
         return stream;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private CombinedStream GetCombinedStream(int firstSegmentIndex, CancellationToken ct)
     {
         return new CombinedStream(

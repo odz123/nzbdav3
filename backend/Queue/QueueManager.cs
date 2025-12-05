@@ -1,4 +1,5 @@
-﻿using NzbWebDAV.Clients.Usenet;
+﻿using System.Runtime.CompilerServices;
+using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
@@ -20,7 +21,8 @@ public class QueueManager : IDisposable
     private readonly WebsocketManager _websocketManager;
     private readonly HealthCheckService _healthCheckService;
 
-    private CancellationTokenSource _sleepingQueueToken = new();
+    // Use volatile for lock-free reads in hot path
+    private volatile CancellationTokenSource _sleepingQueueToken = new();
     private readonly object _sleepingQueueLock = new();
 
     public QueueManager(
@@ -39,17 +41,18 @@ public class QueueManager : IDisposable
         _ = ProcessQueueAsync(_cancellationTokenSource.Token);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public (QueueItem? queueItem, int? progress) GetInProgressQueueItem()
     {
-        return (_inProgressQueueItem?.QueueItem, _inProgressQueueItem?.ProgressPercentage);
+        var item = _inProgressQueueItem;
+        return (item?.QueueItem, item?.ProgressPercentage);
     }
 
     public void AwakenQueue()
     {
-        lock (_sleepingQueueLock)
-        {
-            _sleepingQueueToken.Cancel();
-        }
+        // Take reference to avoid race condition
+        var token = _sleepingQueueToken;
+        token.Cancel();
     }
 
     public async Task RemoveQueueItemsAsync
