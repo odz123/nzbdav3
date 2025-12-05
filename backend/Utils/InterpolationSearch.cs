@@ -1,4 +1,5 @@
-﻿using NzbWebDAV.Exceptions;
+﻿using System.Runtime.CompilerServices;
+using NzbWebDAV.Exceptions;
 using NzbWebDAV.Models;
 
 namespace NzbWebDAV.Utils;
@@ -22,7 +23,28 @@ public static class InterpolationSearch
         ).GetAwaiter().GetResult();
     }
 
-    public static async Task<Result> Find
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Task<Result> Find
+    (
+        long searchByte,
+        LongRange indexRangeToSearch,
+        LongRange byteRangeToSearch,
+        Func<int, ValueTask<LongRange>> getByteRangeOfGuessedIndex,
+        CancellationToken cancellationToken
+    )
+    {
+        // Fast path: single index - no search needed
+        if (indexRangeToSearch.Count == 1)
+        {
+            if (!byteRangeToSearch.Contains(searchByte))
+                throw new SeekPositionNotFoundException($"Corrupt file. Cannot find byte position {searchByte}.");
+            return Task.FromResult(new Result((int)indexRangeToSearch.StartInclusive, byteRangeToSearch));
+        }
+
+        return FindCore(searchByte, indexRangeToSearch, byteRangeToSearch, getByteRangeOfGuessedIndex, cancellationToken);
+    }
+
+    private static async Task<Result> FindCore
     (
         long searchByte,
         LongRange indexRangeToSearch,
@@ -39,7 +61,7 @@ public static class InterpolationSearch
             if (!byteRangeToSearch.Contains(searchByte) || indexRangeToSearch.Count <= 0)
                 throw new SeekPositionNotFoundException($"Corrupt file. Cannot find byte position {searchByte}.");
 
-            // make a guess
+            // make a guess using interpolation
             var searchByteFromStart = searchByte - byteRangeToSearch.StartInclusive;
             var bytesPerIndex = (double)byteRangeToSearch.Count / indexRangeToSearch.Count;
             var guessFromStart = (long)Math.Floor(searchByteFromStart / bytesPerIndex);

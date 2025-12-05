@@ -144,7 +144,7 @@ public sealed class BufferToEndStream : Stream
     // ───────────────────────────────────  Stream overrides
     public override int Read(Span<byte> buffer)
     {
-        // simple sync path – allocate once then copy
+        // Use ArrayPool for temporary buffer - unavoidable since Span can't be passed to async
         byte[] tmp = ArrayPool<byte>.Shared.Rent(buffer.Length);
         try
         {
@@ -159,8 +159,12 @@ public sealed class BufferToEndStream : Stream
         }
     }
 
-    public override int Read(byte[] array, int offset, int count) =>
-        Read(array.AsSpan(offset, count));
+    public override int Read(byte[] array, int offset, int count)
+    {
+        // Direct path for byte array - reads directly into caller's buffer
+        return ReadCoreAsync(array.AsMemory(offset, count), SigtermUtil.GetCancellationToken())
+               .AsTask().GetAwaiter().GetResult();
+    }
 
     public override ValueTask<int> ReadAsync(
         Memory<byte>      buffer,

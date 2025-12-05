@@ -10,7 +10,7 @@ public class CachingNntpClient(INntpClient client, MemoryCache cache) : Wrapping
     private readonly MemoryCacheEntryOptions _cacheOptions = new()
     {
         Size = 1,
-        SlidingExpiration = TimeSpan.FromHours(3)
+        SlidingExpiration = TimeSpan.FromHours(6) // Longer expiration - headers don't change
     };
 
     public override async Task<YencHeaderStream> GetSegmentStreamAsync
@@ -20,20 +20,29 @@ public class CachingNntpClient(INntpClient client, MemoryCache cache) : Wrapping
         CancellationToken ct
     )
     {
-        var cacheKey = segmentId;
         var stream = await Client.GetSegmentStreamAsync(segmentId, includeHeaders, ct).ConfigureAwait(false);
-        cache.Set(cacheKey, stream.Header, _cacheOptions);
+        // Cache the header for future seeking operations
+        cache.Set(segmentId, stream.Header, _cacheOptions);
         return stream;
     }
 
-    public override async Task<YencHeader> GetSegmentYencHeaderAsync(string segmentId, CancellationToken ct)
+    public override Task<YencHeader> GetSegmentYencHeaderAsync(string segmentId, CancellationToken ct)
     {
-        var cacheKey = segmentId;
-        return (await cache.GetOrCreateAsync(cacheKey, cacheEntry =>
+        // Fast path: synchronous cache check - avoids async state machine overhead on cache hit
+        if (cache.TryGetValue(segmentId, out YencHeader? cachedHeader) && cachedHeader is not null)
         {
-            cacheEntry.SetOptions(_cacheOptions);
-            return Client.GetSegmentYencHeaderAsync(segmentId, ct);
-        }).ConfigureAwait(false))!;
+            return Task.FromResult(cachedHeader);
+        }
+
+        // Slow path: fetch from server and cache
+        return GetSegmentYencHeaderSlowAsync(segmentId, ct);
+    }
+
+    private async Task<YencHeader> GetSegmentYencHeaderSlowAsync(string segmentId, CancellationToken ct)
+    {
+        var header = await Client.GetSegmentYencHeaderAsync(segmentId, ct).ConfigureAwait(false);
+        cache.Set(segmentId, header, _cacheOptions);
+        return header;
     }
 
     public override async Task<long> GetFileSizeAsync(NzbFile file, CancellationToken ct)

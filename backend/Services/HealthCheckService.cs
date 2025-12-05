@@ -1,4 +1,5 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using System.Collections.Concurrent;
+using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Clients.Usenet.Connections;
 using NzbWebDAV.Config;
@@ -22,7 +23,8 @@ public class HealthCheckService
     private readonly WebsocketManager _websocketManager;
     private readonly CancellationToken _cancellationToken = SigtermUtil.GetCancellationToken();
 
-    private readonly HashSet<string> _missingSegmentIds = [];
+    // Use ConcurrentDictionary for lock-free reads - much faster than HashSet with lock
+    private ConcurrentDictionary<string, byte> _missingSegmentIds = new();
 
     public HealthCheckService
     (
@@ -39,7 +41,7 @@ public class HealthCheckService
         {
             // when usenet host changes, clear the missing segments cache
             if (!configEventArgs.ChangedConfig.ContainsKey("usenet.host")) return;
-            lock (_missingSegmentIds) _missingSegmentIds.Clear();
+            _missingSegmentIds = new ConcurrentDictionary<string, byte>();
         };
 
         _ = StartMonitoringService();
@@ -162,8 +164,7 @@ public class HealthCheckService
             _ = _websocketManager.SendMessage(WebsocketTopic.HealthItemProgress, $"{davItem.Id}|100");
             _ = _websocketManager.SendMessage(WebsocketTopic.HealthItemProgress, $"{davItem.Id}|done");
             if (FilenameUtil.IsImportantFileType(davItem.Name))
-                lock (_missingSegmentIds)
-                    _missingSegmentIds.Add(e.SegmentId);
+                _missingSegmentIds.TryAdd(e.SegmentId, 0);
 
             // when usenet article is missing, perform repairs
             await Repair(davItem, dbClient, ct).ConfigureAwait(false);
@@ -349,11 +350,9 @@ public class HealthCheckService
 
     public void CheckCachedMissingSegmentIds(IEnumerable<string> segmentIds)
     {
-        lock (_missingSegmentIds)
-        {
-            foreach (var segmentId in segmentIds)
-                if (_missingSegmentIds.Contains(segmentId))
-                    throw new UsenetArticleNotFoundException(segmentId);
-        }
+        // Lock-free check using ConcurrentDictionary - much faster for reads
+        foreach (var segmentId in segmentIds)
+            if (_missingSegmentIds.ContainsKey(segmentId))
+                throw new UsenetArticleNotFoundException(segmentId);
     }
 }

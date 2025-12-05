@@ -1,7 +1,10 @@
-﻿namespace NzbWebDAV.Streams;
+﻿using System.Buffers;
+
+namespace NzbWebDAV.Streams;
 
 public class CombinedStream(IEnumerable<Task<Stream>> streams) : Stream
 {
+    private const int DiscardBufferSize = 8192; // Larger buffer for better throughput
     private readonly IEnumerator<Task<Stream>> _streams = streams.GetEnumerator();
     private Stream? _currentStream;
     private long _position;
@@ -23,9 +26,19 @@ public class CombinedStream(IEnumerable<Task<Stream>> streams) : Stream
         return ReadAsync(buffer, offset, count).GetAwaiter().GetResult();
     }
 
-    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
-        if (count == 0) return 0;
+        return ReadAsyncCore(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+    }
+
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        return ReadAsyncCore(buffer, cancellationToken);
+    }
+
+    private async ValueTask<int> ReadAsyncCore(Memory<byte> buffer, CancellationToken cancellationToken)
+    {
+        if (buffer.Length == 0) return 0;
         while (!cancellationToken.IsCancellationRequested)
         {
             // If we haven't read the first stream, read it.
@@ -36,11 +49,7 @@ public class CombinedStream(IEnumerable<Task<Stream>> streams) : Stream
             }
 
             // read from our current stream
-            var readCount = await _currentStream.ReadAsync
-            (
-                buffer.AsMemory(offset, count),
-                cancellationToken
-            ).ConfigureAwait(false);
+            var readCount = await _currentStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
             _position += readCount;
             if (readCount > 0) return readCount;
 
@@ -56,17 +65,23 @@ public class CombinedStream(IEnumerable<Task<Stream>> streams) : Stream
 
     public async Task DiscardBytesAsync(long count)
     {
-        if (count == 0) return;
+        if (count <= 0) return;
         var remaining = count;
-        var throwaway = new byte[1024];
-        while (remaining > 0)
+        var buffer = ArrayPool<byte>.Shared.Rent(DiscardBufferSize);
+        try
         {
-            var toRead = (int)Math.Min(remaining, throwaway.Length);
-            var read = await ReadAsync(throwaway, 0, toRead).ConfigureAwait(false);
-            remaining -= read;
-            if (read == 0) break;
+            while (remaining > 0)
+            {
+                var toRead = (int)Math.Min(remaining, buffer.Length);
+                var read = await ReadAsync(buffer, 0, toRead).ConfigureAwait(false);
+                if (read == 0) break;
+                remaining -= read;
+            }
         }
-        // Note: _position is already updated by ReadAsync, no need to add count here
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
     }
 
     public override void Flush()

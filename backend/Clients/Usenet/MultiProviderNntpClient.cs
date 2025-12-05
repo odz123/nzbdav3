@@ -14,6 +14,11 @@ namespace NzbWebDAV.Clients.Usenet;
 
 public class MultiProviderNntpClient(List<MultiConnectionNntpClient> providers) : INntpClient
 {
+    // Pre-computed list of enabled providers to avoid filtering on every call
+    private List<MultiConnectionNntpClient> _enabledProviders = providers
+        .Where(x => x.ProviderType != ProviderType.Disabled)
+        .ToList();
+
     public Task<bool> ConnectAsync(string host, int port, bool useSsl, CancellationToken cancellationToken)
     {
         throw new NotSupportedException("Please connect within the connectionFactory");
@@ -75,9 +80,27 @@ public class MultiProviderNntpClient(List<MultiConnectionNntpClient> providers) 
         ExceptionDispatchInfo? lastException = null;
         var lastSuccessfulProviderContext = cancellationToken.GetContext<LastSuccessfulProviderContext>();
         var lastSuccessfulProvider = lastSuccessfulProviderContext?.Provider;
-        var orderedProviders = GetOrderedProviders(lastSuccessfulProvider);
         T? result = default;
-        foreach (var provider in orderedProviders)
+
+        // Fast path: try the preferred provider first without any allocation
+        if (lastSuccessfulProvider is not null && lastSuccessfulProvider.ProviderType != ProviderType.Disabled)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                result = await task.Invoke(lastSuccessfulProvider).ConfigureAwait(false);
+                if (result is NntpStatResponse r && r.ResponseType != NntpStatResponseType.ArticleExists)
+                    throw new UsenetArticleNotFoundException(r.MessageId.Value);
+                return result;
+            }
+            catch (Exception e) when (e is not OperationCanceledException and not TaskCanceledException)
+            {
+                lastException = ExceptionDispatchInfo.Capture(e);
+            }
+        }
+
+        // Fallback: try other providers
+        foreach (var provider in GetOrderedProviders(lastSuccessfulProvider))
         {
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -110,17 +133,80 @@ public class MultiProviderNntpClient(List<MultiConnectionNntpClient> providers) 
         throw new Exception("There are no usenet providers configured.");
     }
 
-    private IEnumerable<MultiConnectionNntpClient> GetOrderedProviders(MultiConnectionNntpClient? preferredProvider)
+    /// <summary>
+    /// Gets providers ordered by availability without LINQ allocations.
+    /// </summary>
+    private IEnumerable<MultiConnectionNntpClient> GetOrderedProviders(MultiConnectionNntpClient? excludeProvider)
     {
-        return providers
-            .Where(x => x.ProviderType != ProviderType.Disabled)
+        var enabledProviders = _enabledProviders;
+        var count = enabledProviders.Count;
+
+        if (count == 0) yield break;
+
+        // Single provider fast path
+        if (count == 1)
+        {
+            var provider = enabledProviders[0];
+            if (provider != excludeProvider)
+                yield return provider;
+            yield break;
+        }
+
+        // For 2-3 providers (common case), use direct comparison to avoid sorting allocations
+        if (count <= 3)
+        {
+            // Find best provider by availability metrics
+            MultiConnectionNntpClient? best = null;
+            foreach (var provider in enabledProviders)
+            {
+                if (provider == excludeProvider) continue;
+                if (best == null || IsBetterProvider(provider, best))
+                    best = provider;
+            }
+
+            if (best != null)
+            {
+                yield return best;
+                foreach (var provider in enabledProviders)
+                {
+                    if (provider != excludeProvider && provider != best)
+                        yield return provider;
+                }
+            }
+            yield break;
+        }
+
+        // For larger collections, fall back to LINQ (rare case)
+        foreach (var provider in enabledProviders
+            .Where(x => x != excludeProvider)
             .OrderBy(x => x.ProviderType)
             .ThenByDescending(x => x.IdleConnections)
-            .ThenByDescending(x => x.RemainingSemaphoreSlots)
-            .Prepend(preferredProvider)
-            .Where(x => x is not null)
-            .Select(x => x!)
-            .Distinct();
+            .ThenByDescending(x => x.RemainingSemaphoreSlots))
+        {
+            yield return provider;
+        }
+    }
+
+    private static bool IsBetterProvider(MultiConnectionNntpClient a, MultiConnectionNntpClient b)
+    {
+        // Lower ProviderType is better (Primary < Secondary)
+        if (a.ProviderType != b.ProviderType)
+            return a.ProviderType < b.ProviderType;
+        // More idle connections is better
+        if (a.IdleConnections != b.IdleConnections)
+            return a.IdleConnections > b.IdleConnections;
+        // More remaining semaphore slots is better
+        return a.RemainingSemaphoreSlots > b.RemainingSemaphoreSlots;
+    }
+
+    /// <summary>
+    /// Refreshes the enabled providers list when configuration changes.
+    /// </summary>
+    public void RefreshEnabledProviders()
+    {
+        _enabledProviders = providers
+            .Where(x => x.ProviderType != ProviderType.Disabled)
+            .ToList();
     }
 
     public void Dispose()

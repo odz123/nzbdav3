@@ -12,7 +12,7 @@ public class NzbFileStream(
     int concurrentConnections
 ) : Stream
 {
-    private long _position = 0;
+    private long _position;
     private CombinedStream? _innerStream;
     private bool _disposed;
 
@@ -28,17 +28,30 @@ public class NzbFileStream(
 
     public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
-        if (_innerStream == null) _innerStream = await GetFileStream(_position, cancellationToken).ConfigureAwait(false);
-        var read = await _innerStream.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
+        _innerStream ??= await GetFileStream(_position, cancellationToken).ConfigureAwait(false);
+        var read = await _innerStream.ReadAsync(buffer.AsMemory(offset, count), cancellationToken).ConfigureAwait(false);
+        _position += read;
+        return read;
+    }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        _innerStream ??= await GetFileStream(_position, cancellationToken).ConfigureAwait(false);
+        var read = await _innerStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
         _position += read;
         return read;
     }
 
     public override long Seek(long offset, SeekOrigin origin)
     {
-        var absoluteOffset = origin == SeekOrigin.Begin ? offset
-            : origin == SeekOrigin.Current ? _position + offset
-            : throw new InvalidOperationException("SeekOrigin must be Begin or Current.");
+        var absoluteOffset = origin switch
+        {
+            SeekOrigin.Begin => offset,
+            SeekOrigin.Current => _position + offset,
+            SeekOrigin.End => fileSize + offset,
+            _ => throw new ArgumentOutOfRangeException(nameof(origin))
+        };
+
         if (_position == absoluteOffset) return _position;
         _position = absoluteOffset;
         _innerStream?.Dispose();
@@ -70,6 +83,12 @@ public class NzbFileStream(
 
     private async Task<InterpolationSearch.Result> SeekSegment(long byteOffset, CancellationToken ct)
     {
+        // Single segment optimization - no search needed
+        if (fileSegmentIds.Length == 1)
+        {
+            return new InterpolationSearch.Result(0, new LongRange(0, fileSize));
+        }
+
         return await InterpolationSearch.Find(
             byteOffset,
             new LongRange(0, fileSegmentIds.Length),
@@ -88,7 +107,11 @@ public class NzbFileStream(
         if (rangeStart == 0) return GetCombinedStream(0, cancellationToken);
         var foundSegment = await SeekSegment(rangeStart, cancellationToken).ConfigureAwait(false);
         var stream = GetCombinedStream(foundSegment.FoundIndex, cancellationToken);
-        await stream.DiscardBytesAsync(rangeStart - foundSegment.FoundByteRange.StartInclusive).ConfigureAwait(false);
+        var bytesToDiscard = rangeStart - foundSegment.FoundByteRange.StartInclusive;
+        if (bytesToDiscard > 0)
+        {
+            await stream.DiscardBytesAsync(bytesToDiscard).ConfigureAwait(false);
+        }
         return stream;
     }
 
