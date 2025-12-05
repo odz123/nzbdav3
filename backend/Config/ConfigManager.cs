@@ -41,6 +41,7 @@ public class ConfigManager
 
     public void UpdateValues(List<ConfigItem> configItems)
     {
+        ConfigEventArgs? eventArgs = null;
         lock (_config)
         {
             foreach (var configItem in configItems)
@@ -48,12 +49,14 @@ public class ConfigManager
                 _config[configItem.ConfigName] = configItem.ConfigValue;
             }
 
-            OnConfigChanged?.Invoke(this, new ConfigEventArgs
+            eventArgs = new ConfigEventArgs
             {
                 ChangedConfig = configItems.ToDictionary(x => x.ConfigName, x => x.ConfigValue),
-                NewConfig = _config
-            });
+                NewConfig = new Dictionary<string, string>(_config)
+            };
         }
+        // Invoke event outside the lock to prevent potential deadlocks
+        OnConfigChanged?.Invoke(this, eventArgs);
     }
 
     public string GetRcloneMountDir()

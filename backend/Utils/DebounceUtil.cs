@@ -31,12 +31,13 @@ public static class DebounceUtil
 
     public static Action<Action> RunOnlyOnce()
     {
-        var isAlreadyRan = false;
+        var hasRun = 0; // 0 = false, 1 = true (using int for Interlocked)
         return actionToMaybeInvoke =>
         {
-            if (isAlreadyRan) return;
-            isAlreadyRan = true;
-            actionToMaybeInvoke?.Invoke();
+            if (Interlocked.CompareExchange(ref hasRun, 1, 0) == 0)
+            {
+                actionToMaybeInvoke?.Invoke();
+            }
         };
     }
 }

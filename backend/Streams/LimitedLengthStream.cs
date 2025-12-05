@@ -47,7 +47,7 @@ public class LimitedLengthStream(Stream stream, long length) : Stream
 
     public override long Position
     {
-        get => stream.Position;
+        get => _position;
         set => throw new NotSupportedException();
     }
 

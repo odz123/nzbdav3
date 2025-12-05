@@ -66,8 +66,7 @@ public class CombinedStream(IEnumerable<Task<Stream>> streams) : Stream
             remaining -= read;
             if (read == 0) break;
         }
-
-        _position += count;
+        // Note: _position is already updated by ReadAsync, no need to add count here
     }
 
     public override void Flush()
