@@ -7,11 +7,43 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
 {
     public DavDatabaseContext Ctx => ctx;
 
+    #region Compiled Queries - Pre-compiled for maximum performance
+
+    private static readonly Func<DavDatabaseContext, Guid, Task<DavItem?>> GetItemByIdQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid id) =>
+            ctx.Items.FirstOrDefault(i => i.Id == id));
+
+    private static readonly Func<DavDatabaseContext, Guid, Task<DavNzbFile?>> GetNzbFileByIdQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid id) =>
+            ctx.NzbFiles.FirstOrDefault(x => x.Id == id));
+
+    private static readonly Func<DavDatabaseContext, Guid, Task<DavRarFile?>> GetRarFileByIdQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid id) =>
+            ctx.RarFiles.FirstOrDefault(x => x.Id == id));
+
+    private static readonly Func<DavDatabaseContext, Guid, Task<DavMultipartFile?>> GetMultipartFileByIdQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid id) =>
+            ctx.MultipartFiles.FirstOrDefault(x => x.Id == id));
+
+    private static readonly Func<DavDatabaseContext, Guid, string, Task<DavItem?>> GetDirectoryChildQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid dirId, string childName) =>
+            ctx.Items.FirstOrDefault(x => x.ParentId == dirId && x.Name == childName));
+
+    private static readonly Func<DavDatabaseContext, Guid, Task<QueueNzbContents?>> GetQueueNzbContentsByIdQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid id) =>
+            ctx.QueueNzbContents.FirstOrDefault(q => q.Id == id));
+
+    private static readonly Func<DavDatabaseContext, Guid, Task<HistoryItem?>> GetHistoryItemByIdQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid id) =>
+            ctx.HistoryItems.FirstOrDefault(x => x.Id == id));
+
+    #endregion
+
     // file
     public Task<DavItem?> GetFileById(string id)
     {
         var guid = Guid.Parse(id);
-        return ctx.Items.Where(i => i.Id == guid).FirstOrDefaultAsync();
+        return GetItemByIdQuery(ctx, guid);
     }
 
     public Task<List<DavItem>> GetFilesByIdPrefix(string prefix)
@@ -32,7 +64,7 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
 
     public Task<DavItem?> GetDirectoryChildAsync(Guid dirId, string childName, CancellationToken ct = default)
     {
-        return ctx.Items.FirstOrDefaultAsync(x => x.ParentId == dirId && x.Name == childName, ct);
+        return GetDirectoryChildQuery(ctx, dirId, childName);
     }
 
     public async Task<long> GetRecursiveSize(Guid dirId, CancellationToken ct = default)
@@ -70,9 +102,21 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
     }
 
     // nzbfile
-    public async Task<DavNzbFile?> GetNzbFileAsync(Guid id, CancellationToken ct = default)
+    public Task<DavNzbFile?> GetNzbFileAsync(Guid id, CancellationToken ct = default)
     {
-        return await ctx.NzbFiles.FirstOrDefaultAsync(x => x.Id == id, ct).ConfigureAwait(false);
+        return GetNzbFileByIdQuery(ctx, id);
+    }
+
+    // rarfile
+    public Task<DavRarFile?> GetRarFileAsync(Guid id, CancellationToken ct = default)
+    {
+        return GetRarFileByIdQuery(ctx, id);
+    }
+
+    // multipartfile
+    public Task<DavMultipartFile?> GetMultipartFileAsync(Guid id, CancellationToken ct = default)
+    {
+        return GetMultipartFileByIdQuery(ctx, id);
     }
 
     // queue
@@ -86,11 +130,9 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
             .OrderByDescending(q => q.Priority)
             .ThenBy(q => q.CreatedAt)
             .Where(q => q.PauseUntil == null || nowTime >= q.PauseUntil)
-            .Skip(0)
-            .Take(1)
             .FirstOrDefaultAsync(ct).ConfigureAwait(false);
         var queueNzbContents = queueItem != null
-            ? await Ctx.QueueNzbContents.FirstOrDefaultAsync(q => q.Id == queueItem.Id, ct).ConfigureAwait(false)
+            ? await GetQueueNzbContentsByIdQuery(ctx, queueItem.Id).ConfigureAwait(false)
             : null;
         return (queueItem, queueNzbContents);
     }
@@ -130,9 +172,9 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
     }
 
     // history
-    public async Task<HistoryItem?> GetHistoryItemAsync(string id)
+    public Task<HistoryItem?> GetHistoryItemAsync(string id)
     {
-        return await Ctx.HistoryItems.FirstOrDefaultAsync(x => x.Id == Guid.Parse(id)).ConfigureAwait(false);
+        return GetHistoryItemByIdQuery(ctx, Guid.Parse(id));
     }
 
     public async Task RemoveHistoryItemsAsync(List<Guid> ids, bool deleteFiles, CancellationToken ct = default)

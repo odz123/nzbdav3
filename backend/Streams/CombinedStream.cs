@@ -4,7 +4,7 @@ namespace NzbWebDAV.Streams;
 
 public class CombinedStream(IEnumerable<Task<Stream>> streams) : Stream
 {
-    private const int DiscardBufferSize = 8192; // Larger buffer for better throughput
+    private const int DiscardBufferSize = 65536; // 64KB buffer for maximum throughput
     private readonly IEnumerator<Task<Stream>> _streams = streams.GetEnumerator();
     private Stream? _currentStream;
     private long _position;

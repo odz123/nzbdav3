@@ -83,7 +83,12 @@ class Program
             .AddSingleton<QueueManager>()
             .AddSingleton<ArrMonitoringService>()
             .AddSingleton<HealthCheckService>()
-            .AddScoped<DavDatabaseContext>()
+            // Use DbContext pooling for better performance - reuses context instances
+            .AddDbContextPool<DavDatabaseContext>(options =>
+            {
+                options.UseSqlite($"Data Source={DavDatabaseContext.DatabaseFilePath}");
+                options.AddInterceptors(DavDatabaseContext.GetSharedInterceptor());
+            }, poolSize: 128)
             .AddScoped<DavDatabaseClient>()
             .AddScoped<DatabaseStore>()
             .AddScoped<IStore, DatabaseStore>()
