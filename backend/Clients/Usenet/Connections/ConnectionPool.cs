@@ -177,6 +177,9 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 
     /* =================== idle sweeper (background) ================================= */
 
+    // Reusable list for sweep operations to avoid allocations
+    private readonly List<Pooled> _sweepSurvivors = new();
+
     private async Task SweepLoop()
     {
         try
@@ -194,7 +197,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     private async Task SweepOnce()
     {
         var now = Environment.TickCount64;
-        var survivors = new List<Pooled>();
+        _sweepSurvivors.Clear();
         var isAnyConnectionFreed = false;
 
         while (_idleConnections.TryPop(out var item))
@@ -207,13 +210,13 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             }
             else
             {
-                survivors.Add(item);
+                _sweepSurvivors.Add(item);
             }
         }
 
         // Preserve original LIFO order.
-        for (int i = survivors.Count - 1; i >= 0; i--)
-            _idleConnections.Push(survivors[i]);
+        for (int i = _sweepSurvivors.Count - 1; i >= 0; i--)
+            _idleConnections.Push(_sweepSurvivors[i]);
 
         if (isAnyConnectionFreed)
             TriggerConnectionPoolChangedEvent();

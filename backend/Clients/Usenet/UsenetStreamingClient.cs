@@ -27,7 +27,8 @@ public class UsenetStreamingClient
 
         // initialize the nntp-client
         var multiProviderClient = CreateMultiProviderClient(providerConfig);
-        var cache = new MemoryCache(new MemoryCacheOptions() { SizeLimit = 8192 });
+        // Larger cache (32K entries) for YENC headers - they're small (~100 bytes each)
+        var cache = new MemoryCache(new MemoryCacheOptions() { SizeLimit = 32768 });
         _client = new CachingNntpClient(multiProviderClient, cache);
 
         // when config changes, update the connection-pool
