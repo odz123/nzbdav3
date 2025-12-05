@@ -1,5 +1,6 @@
 ﻿// ReSharper disable InconsistentNaming
 
+using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 
 namespace NzbWebDAV.Extensions;
@@ -14,6 +15,7 @@ public static class IEnumerableTaskExtensions
     /// <param name="concurrency">The max concurrency</param>
     /// <typeparam name="T">The resulting type of each task</typeparam>
     /// <returns>An IEnumerable that yields tasks in order they were queued</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static IEnumerable<Task<T>> WithConcurrency<T>
     (
         this IEnumerable<Task<T>> tasks,
@@ -23,14 +25,17 @@ public static class IEnumerableTaskExtensions
         if (concurrency < 1)
             throw new ArgumentException("concurrency must be greater than zero.");
 
+        // Fast path for single concurrency
         if (concurrency == 1)
         {
             foreach (var task in tasks) yield return task;
             yield break;
         }
 
+        // Pre-allocate queue with expected capacity to avoid resizing
+        var runningTasks = new Queue<Task<T>>(concurrency);
         var isFirst = true;
-        var runningTasks = new Queue<Task<T>>();
+
         try
         {
             foreach (var task in tasks)
@@ -53,14 +58,29 @@ public static class IEnumerableTaskExtensions
         }
         finally
         {
-            while (runningTasks.Count > 0)
+            // Cleanup remaining tasks without allocating closures
+            while (runningTasks.TryDequeue(out var remainingTask))
             {
-                runningTasks.Dequeue().ContinueWith(x =>
-                {
-                    if (x.Status == TaskStatus.RanToCompletion)
-                        x.Result.Dispose();
-                });
+                DisposeOnCompletion(remainingTask);
             }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void DisposeOnCompletion<T>(Task<T> task) where T : IDisposable
+    {
+        if (task.IsCompleted)
+        {
+            if (task.IsCompletedSuccessfully)
+                task.Result.Dispose();
+        }
+        else
+        {
+            task.ContinueWith(static t =>
+            {
+                if (t.IsCompletedSuccessfully)
+                    t.Result.Dispose();
+            }, TaskContinuationOptions.ExecuteSynchronously);
         }
     }
 
@@ -77,11 +97,12 @@ public static class IEnumerableTaskExtensions
         if (concurrency < 1)
             throw new ArgumentException("concurrency must be greater than zero.");
 
-        // Use an unbounded channel for completion notifications - O(1) writes
+        // Use an unbounded channel with optimized settings
         var channel = Channel.CreateUnbounded<Task<T>>(new UnboundedChannelOptions
         {
             SingleReader = true,
-            SingleWriter = false
+            SingleWriter = false,
+            AllowSynchronousContinuations = true // Reduces context switches
         });
 
         var activeCount = 0;
@@ -94,7 +115,7 @@ public static class IEnumerableTaskExtensions
         {
             var task = enumerator.Current;
             activeCount++;
-            _ = CompleteAndNotify(task, channel.Writer);
+            _ = CompleteAndNotifyAsync(task, channel.Writer);
         }
 
         // If no tasks, we're done
@@ -115,7 +136,7 @@ public static class IEnumerableTaskExtensions
             {
                 var nextTask = enumerator.Current;
                 activeCount++;
-                _ = CompleteAndNotify(nextTask, channel.Writer);
+                _ = CompleteAndNotifyAsync(nextTask, channel.Writer);
             }
             else
             {
@@ -125,22 +146,23 @@ public static class IEnumerableTaskExtensions
             // Yield the result (will throw if task faulted)
             yield return await completedTask.ConfigureAwait(false);
         }
+    }
 
-        static async Task CompleteAndNotify(Task<T> task, ChannelWriter<Task<T>> writer)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static async Task CompleteAndNotifyAsync<T>(Task<T> task, ChannelWriter<Task<T>> writer)
+    {
+        try
         {
-            try
-            {
-                await task.ConfigureAwait(false);
-            }
-            catch
-            {
-                // Exception will be observed when the task is awaited in the main loop
-            }
-            finally
-            {
-                // Notify that this task completed - O(1) write
-                writer.TryWrite(task);
-            }
+            await task.ConfigureAwait(false);
+        }
+        catch
+        {
+            // Exception will be observed when the task is awaited in the main loop
+        }
+        finally
+        {
+            // Notify that this task completed - O(1) write
+            writer.TryWrite(task);
         }
     }
 }

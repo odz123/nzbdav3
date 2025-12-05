@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Database.Models;
 
@@ -37,31 +38,60 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
         EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid id) =>
             ctx.HistoryItems.FirstOrDefault(x => x.Id == id));
 
+    // Additional compiled queries for frequently used operations
+    private static readonly Func<DavDatabaseContext, Guid, IAsyncEnumerable<DavItem>> GetDirectoryChildrenStreamQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, Guid dirId) =>
+            ctx.Items.Where(x => x.ParentId == dirId));
+
+    private static readonly Func<DavDatabaseContext, string, IAsyncEnumerable<DavItem>> GetFilesByIdPrefixStreamQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, string prefix) =>
+            ctx.Items.Where(i => i.IdPrefix == prefix &&
+                (i.Type == DavItem.ItemType.NzbFile ||
+                 i.Type == DavItem.ItemType.RarFile ||
+                 i.Type == DavItem.ItemType.MultipartFile)));
+
+    private static readonly Func<DavDatabaseContext, Task<int>> GetQueueItemsCountAllQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx) => ctx.QueueItems.Count());
+
+    private static readonly Func<DavDatabaseContext, string, Task<int>> GetQueueItemsCountByCategoryQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx, string category) =>
+            ctx.QueueItems.Count(q => q.Category == category));
+
+    private static readonly Func<DavDatabaseContext, Task<long?>> GetTotalFileSizeQuery =
+        EF.CompileAsyncQuery((DavDatabaseContext ctx) => ctx.Items.Sum(x => x.FileSize));
+
     #endregion
 
     // file
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Task<DavItem?> GetFileById(string id)
     {
         var guid = Guid.Parse(id);
         return GetItemByIdQuery(ctx, guid);
     }
 
-    public Task<List<DavItem>> GetFilesByIdPrefix(string prefix)
+    public async Task<List<DavItem>> GetFilesByIdPrefix(string prefix)
     {
-        return ctx.Items
-            .Where(i => i.IdPrefix == prefix)
-            .Where(i => i.Type == DavItem.ItemType.NzbFile
-                        || i.Type == DavItem.ItemType.RarFile
-                        || i.Type == DavItem.ItemType.MultipartFile)
-            .ToListAsync();
+        var results = new List<DavItem>();
+        await foreach (var item in GetFilesByIdPrefixStreamQuery(ctx, prefix).ConfigureAwait(false))
+        {
+            results.Add(item);
+        }
+        return results;
     }
 
     // directory
-    public Task<List<DavItem>> GetDirectoryChildrenAsync(Guid dirId, CancellationToken ct = default)
+    public async Task<List<DavItem>> GetDirectoryChildrenAsync(Guid dirId, CancellationToken ct = default)
     {
-        return ctx.Items.Where(x => x.ParentId == dirId).ToListAsync(ct);
+        var results = new List<DavItem>();
+        await foreach (var item in GetDirectoryChildrenStreamQuery(ctx, dirId).WithCancellation(ct).ConfigureAwait(false))
+        {
+            results.Add(item);
+        }
+        return results;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Task<DavItem?> GetDirectoryChildAsync(Guid dirId, string childName, CancellationToken ct = default)
     {
         return GetDirectoryChildQuery(ctx, dirId, childName);
@@ -71,7 +101,7 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
     {
         if (dirId == DavItem.Root.Id)
         {
-            return await Ctx.Items.SumAsync(x => x.FileSize, ct).ConfigureAwait(false) ?? 0;
+            return await GetTotalFileSizeQuery(ctx).ConfigureAwait(false) ?? 0;
         }
 
         const string sql = @"
@@ -102,18 +132,21 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
     }
 
     // nzbfile
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Task<DavNzbFile?> GetNzbFileAsync(Guid id, CancellationToken ct = default)
     {
         return GetNzbFileByIdQuery(ctx, id);
     }
 
     // rarfile
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Task<DavRarFile?> GetRarFileAsync(Guid id, CancellationToken ct = default)
     {
         return GetRarFileByIdQuery(ctx, id);
     }
 
     // multipartfile
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Task<DavMultipartFile?> GetMultipartFileAsync(Guid id, CancellationToken ct = default)
     {
         return GetMultipartFileByIdQuery(ctx, id);
@@ -131,9 +164,8 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
             .ThenBy(q => q.CreatedAt)
             .Where(q => q.PauseUntil == null || nowTime >= q.PauseUntil)
             .FirstOrDefaultAsync(ct).ConfigureAwait(false);
-        var queueNzbContents = queueItem != null
-            ? await GetQueueNzbContentsByIdQuery(ctx, queueItem.Id).ConfigureAwait(false)
-            : null;
+        if (queueItem == null) return (null, null);
+        var queueNzbContents = await GetQueueNzbContentsByIdQuery(ctx, queueItem.Id).ConfigureAwait(false);
         return (queueItem, queueNzbContents);
     }
 
@@ -145,33 +177,34 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
         CancellationToken ct = default
     )
     {
-        var queueItems = category != null
+        var query = category != null
             ? Ctx.QueueItems.Where(q => q.Category == category)
-            : Ctx.QueueItems;
-        return queueItems
+            : Ctx.QueueItems.AsQueryable();
+        return query
             .OrderByDescending(q => q.Priority)
             .ThenBy(q => q.CreatedAt)
             .Skip(start)
             .Take(limit)
+            .AsNoTracking()
             .ToArrayAsync(cancellationToken: ct);
     }
 
     public Task<int> GetQueueItemsCount(string? category, CancellationToken ct = default)
     {
-        var queueItems = category != null
-            ? Ctx.QueueItems.Where(q => q.Category == category)
-            : Ctx.QueueItems;
-        return queueItems.CountAsync(cancellationToken: ct);
+        return category != null
+            ? GetQueueItemsCountByCategoryQuery(ctx, category)
+            : GetQueueItemsCountAllQuery(ctx);
     }
 
-    public async Task RemoveQueueItemsAsync(List<Guid> ids, CancellationToken ct = default)
+    public Task RemoveQueueItemsAsync(List<Guid> ids, CancellationToken ct = default)
     {
-        await Ctx.QueueItems
+        return Ctx.QueueItems
             .Where(x => ids.Contains(x.Id))
-            .ExecuteDeleteAsync(ct).ConfigureAwait(false);
+            .ExecuteDeleteAsync(ct);
     }
 
     // history
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Task<HistoryItem?> GetHistoryItemAsync(string id)
     {
         return GetHistoryItemByIdQuery(ctx, Guid.Parse(id));
@@ -194,20 +227,16 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
             .ExecuteDeleteAsync(ct).ConfigureAwait(false);
     }
 
-    private class FileSizeResult
-    {
-        public long TotalSize { get; init; }
-    }
-
     // health check
-    public async Task<List<HealthCheckStat>> GetHealthCheckStatsAsync
+    public Task<List<HealthCheckStat>> GetHealthCheckStatsAsync
     (
         DateTimeOffset from,
         DateTimeOffset to,
         CancellationToken ct = default
     )
     {
-        return await Ctx.HealthCheckStats
+        return Ctx.HealthCheckStats
+            .AsNoTracking()
             .Where(h => h.DateStartInclusive >= from && h.DateStartInclusive <= to)
             .GroupBy(h => new { h.Result, h.RepairStatus })
             .Select(g => new HealthCheckStat
@@ -216,20 +245,19 @@ public sealed class DavDatabaseClient(DavDatabaseContext ctx)
                 RepairStatus = g.Key.RepairStatus,
                 Count = g.Select(r => r.Count).Sum(),
             })
-            .ToListAsync(ct).ConfigureAwait(false);
+            .ToListAsync(ct);
     }
 
     // completed-symlinks
-    public async Task<List<DavItem>> GetCompletedSymlinkCategoryChildren(string category,
+    public Task<List<DavItem>> GetCompletedSymlinkCategoryChildren(string category,
         CancellationToken ct = default)
     {
-        var query = from historyItem in Ctx.HistoryItems
+        return (from historyItem in Ctx.HistoryItems.AsNoTracking()
             where historyItem.Category == category
                   && historyItem.DownloadStatus == HistoryItem.DownloadStatusOption.Completed
                   && historyItem.DownloadDirId != null
-            join davItem in Ctx.Items on historyItem.DownloadDirId equals davItem.Id
+            join davItem in Ctx.Items.AsNoTracking() on historyItem.DownloadDirId equals davItem.Id
             where davItem.Type == DavItem.ItemType.Directory
-            select davItem;
-        return await query.Distinct().ToListAsync(ct).ConfigureAwait(false);
+            select davItem).Distinct().ToListAsync(ct);
     }
 }
