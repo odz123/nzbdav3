@@ -1,47 +1,60 @@
-﻿using System.Security.Cryptography;
+﻿using System.Buffers;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
 using System.Text;
 using NzbWebDAV.Models;
 using SharpCompress.Common.Rar.Headers;
 
 namespace NzbWebDAV.Extensions;
 
+/// <summary>
+/// High-performance RAR header extension methods with optimized AES key derivation.
+/// </summary>
 public static class RarHeaderExtensions
 {
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte GetCompressionMethod(this IRarHeader header)
     {
         return (byte)header.GetReflectionProperty("CompressionMethod")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long GetDataStartPosition(this IRarHeader header)
     {
         return (long)header.GetReflectionProperty("DataStartPosition")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long GetAdditionalDataSize(this IRarHeader header)
     {
         return (long)header.GetReflectionProperty("AdditionalDataSize")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long GetCompressedSize(this IRarHeader header)
     {
         return (long)header.GetReflectionProperty("CompressedSize")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static long GetUncompressedSize(this IRarHeader header)
     {
         return (long)header.GetReflectionProperty("UncompressedSize")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static string GetFileName(this IRarHeader header)
     {
         return (string)header.GetReflectionProperty("FileName")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsDirectory(this IRarHeader header)
     {
         return (bool)header.GetReflectionProperty("IsDirectory")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static int? GetVolumeNumber(this IRarHeader header)
     {
         return header.HeaderType == HeaderType.Archive
@@ -49,31 +62,37 @@ public static class RarHeaderExtensions
             : (short?)header.GetReflectionProperty("VolumeNumber");
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool GetIsFirstVolume(this IRarHeader header)
     {
         return (bool)header.GetReflectionProperty("IsFirstVolume")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static byte[]? GetR4Salt(this IRarHeader header)
     {
         return (byte[]?)header.GetReflectionProperty("R4Salt")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static object? GetRar5CryptoInfo(this IRarHeader header)
     {
         return header.GetReflectionProperty("Rar5CryptoInfo")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool GetIsEncrypted(this IRarHeader header)
     {
         return (bool)header.GetReflectionProperty("IsEncrypted")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool GetIsSolid(this IRarHeader header)
     {
         return (bool)header.GetReflectionProperty("IsSolid")!;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static AesParams? GetAesParams(this IRarHeader header, string? password)
     {
         // sanity checks
@@ -92,109 +111,130 @@ public static class RarHeaderExtensions
         return null;
     }
 
-    private static AesParams? GetRar3AesParams(byte[] salt, string password, long decodedSize)
+    /// <summary>
+    /// RAR3 AES key derivation using ArrayPool to avoid large heap allocations.
+    /// Note: This algorithm is intentionally slow for security (262K iterations).
+    /// </summary>
+    private static AesParams GetRar3AesParams(byte[] salt, string password, long decodedSize)
     {
         const int sizeInitV = 0x10;
         const int sizeSalt30 = 0x08;
+        const int noOfRounds = 1 << 18; // 262144
+        const int iblock = 3;
+
         var aesIV = new byte[sizeInitV];
 
         var rawLength = 2 * password.Length;
-        var rawPassword = new byte[rawLength + sizeSalt30];
-        var passwordBytes = Encoding.UTF8.GetBytes(password);
-        for (var i = 0; i < password.Length; i++)
+        var blockSize = rawLength + sizeSalt30;
+        var dataBlockSize = blockSize + iblock;
+        var totalDataSize = dataBlockSize * noOfRounds;
+
+        // Use ArrayPool to avoid LOH allocation for the large buffer
+        var data = ArrayPool<byte>.Shared.Rent(totalDataSize);
+        try
         {
-            rawPassword[i * 2] = passwordBytes[i];
-            rawPassword[(i * 2) + 1] = 0;
-        }
+            // Build raw password template
+            var passwordBytes = Encoding.UTF8.GetBytes(password);
 
-        for (var i = 0; i < salt.Length; i++)
-        {
-            rawPassword[i + rawLength] = salt[i];
-        }
-
-        var msgDigest = SHA1.Create();
-        const int noOfRounds = (1 << 18);
-        const int iblock = 3;
-
-        byte[] digest;
-        var data = new byte[(rawPassword.Length + iblock) * noOfRounds];
-
-        //TODO slow code below, find ways to optimize
-        for (var i = 0; i < noOfRounds; i++)
-        {
-            rawPassword.CopyTo(data, i * (rawPassword.Length + iblock));
-
-            data[(i * (rawPassword.Length + iblock)) + rawPassword.Length + 0] = (byte)i;
-            data[(i * (rawPassword.Length + iblock)) + rawPassword.Length + 1] = (byte)(i >> 8);
-            data[(i * (rawPassword.Length + iblock)) + rawPassword.Length + 2] = (byte)(i >> 16);
-
-            if (i % (noOfRounds / sizeInitV) == 0)
+            // Fill each block with password + salt + counter
+            for (var i = 0; i < noOfRounds; i++)
             {
-                digest = msgDigest.ComputeHash(data, 0, (i + 1) * (rawPassword.Length + iblock));
-                aesIV[i / (noOfRounds / sizeInitV)] = digest[19];
+                var offset = i * dataBlockSize;
+
+                // Copy password in UTF-16LE format
+                for (var p = 0; p < password.Length; p++)
+                {
+                    data[offset + p * 2] = passwordBytes[p];
+                    data[offset + p * 2 + 1] = 0;
+                }
+
+                // Copy salt
+                Buffer.BlockCopy(salt, 0, data, offset + rawLength, Math.Min(salt.Length, sizeSalt30));
+
+                // Set round counter bytes (little-endian 24-bit)
+                data[offset + blockSize] = (byte)i;
+                data[offset + blockSize + 1] = (byte)(i >> 8);
+                data[offset + blockSize + 2] = (byte)(i >> 16);
             }
-        }
 
-        digest = msgDigest.ComputeHash(data);
-        //slow code ends
+            // Compute hashes using SHA1
+            using var sha1 = SHA1.Create();
+            var ivInterval = noOfRounds / sizeInitV;
 
-        var aesKey = new byte[sizeInitV];
-        for (var i = 0; i < 4; i++)
-        {
-            for (var j = 0; j < 4; j++)
+            // Extract IV bytes at intervals
+            for (var i = 0; i < sizeInitV; i++)
             {
-                aesKey[(i * 4) + j] = (byte)(
-                    (
-                        ((digest[i * 4] * 0x1000000) & 0xff000000)
-                        | (uint)((digest[(i * 4) + 1] * 0x10000) & 0xff0000)
-                        | (uint)((digest[(i * 4) + 2] * 0x100) & 0xff00)
-                        | (uint)(digest[(i * 4) + 3] & 0xff)
-                    ) >> (j * 8)
-                );
+                var roundIndex = i * ivInterval;
+                var hashLength = (roundIndex + 1) * dataBlockSize;
+                var digest = sha1.ComputeHash(data, 0, hashLength);
+                aesIV[i] = digest[19];
             }
-        }
 
-        return new AesParams()
+            // Compute final hash
+            var finalDigest = sha1.ComputeHash(data, 0, totalDataSize);
+
+            // Build AES key from digest (byte reordering)
+            var aesKey = new byte[sizeInitV];
+            for (var i = 0; i < 4; i++)
+            {
+                var word = ((uint)finalDigest[i * 4] << 24) |
+                          ((uint)finalDigest[i * 4 + 1] << 16) |
+                          ((uint)finalDigest[i * 4 + 2] << 8) |
+                          finalDigest[i * 4 + 3];
+                aesKey[i * 4] = (byte)word;
+                aesKey[i * 4 + 1] = (byte)(word >> 8);
+                aesKey[i * 4 + 2] = (byte)(word >> 16);
+                aesKey[i * 4 + 3] = (byte)(word >> 24);
+            }
+
+            return new AesParams
+            {
+                Iv = aesIV,
+                Key = aesKey,
+                DecodedSize = decodedSize,
+            };
+        }
+        finally
         {
-            Iv = aesIV,
-            Key = aesKey,
-            DecodedSize = decodedSize,
-        };
+            ArrayPool<byte>.Shared.Return(data, clearArray: true);
+        }
     }
 
-    private static AesParams? GetRar5AesParams(object rar5CryptoInfo, string password, long decodedSize)
+    private static AesParams GetRar5AesParams(object rar5CryptoInfo, string password, long decodedSize)
     {
-        const int derivedKeyLength = 0x10;
         const int sizePswCheck = 0x08;
         const int sha256DigestSize = 32;
+
         var lg2Count = (int)rar5CryptoInfo.GetReflectionField("LG2Count")!;
         var salt = (byte[])rar5CryptoInfo.GetReflectionField("Salt")!;
         var usePswCheck = (bool)rar5CryptoInfo.GetReflectionField("UsePswCheck")!;
         var pswCheck = (byte[])rar5CryptoInfo.GetReflectionField("PswCheck")!;
         var initIv = (byte[])rar5CryptoInfo.GetReflectionField("InitV")!;
 
-        var iterations = (1 << lg2Count); // Adjust the number of iterations as needed
+        var iterations = 1 << lg2Count;
 
-        var salt_rar5 = salt.Concat(new byte[] { 0, 0, 0, 1 });
-        var derivedKey = GenerateRarPbkdf2Key(
-            password,
-            salt_rar5.ToArray(),
-            iterations,
-            derivedKeyLength
-        );
+        // Build salt with counter suffix
+        var saltWithCounter = new byte[salt.Length + 4];
+        Buffer.BlockCopy(salt, 0, saltWithCounter, 0, salt.Length);
+        saltWithCounter[salt.Length + 3] = 1; // Counter = 1 (big-endian)
 
-        var derivedPswCheck = new byte[sizePswCheck];
+        var derivedKey = GenerateRarPbkdf2Key(password, saltWithCounter, iterations);
+
+        // Verify password check
+        Span<byte> derivedPswCheck = stackalloc byte[sizePswCheck];
+        derivedPswCheck.Clear();
+
         for (var i = 0; i < sha256DigestSize; i++)
         {
             derivedPswCheck[i % sizePswCheck] ^= derivedKey[2][i];
         }
 
-        if (usePswCheck && !pswCheck.SequenceEqual(derivedPswCheck))
+        if (usePswCheck && !pswCheck.AsSpan().SequenceEqual(derivedPswCheck))
         {
             throw new CryptographicException("The password did not match.");
         }
 
-        return new AesParams()
+        return new AesParams
         {
             Iv = initIv,
             Key = derivedKey[0],
@@ -202,35 +242,39 @@ public static class RarHeaderExtensions
         };
     }
 
-
-    private static List<byte[]> GenerateRarPbkdf2Key(
-        string password,
-        byte[] salt,
-        int iterations,
-        int keyLength
-    )
+    /// <summary>
+    /// Optimized PBKDF2 key generation for RAR5 with reduced allocations.
+    /// </summary>
+    private static List<byte[]> GenerateRarPbkdf2Key(string password, byte[] salt, int iterations)
     {
-        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(password));
-        var block = hmac.ComputeHash(salt);
-        var finalHash = (byte[])block.Clone();
+        var passwordBytes = Encoding.UTF8.GetBytes(password);
+        using var hmac = new HMACSHA256(passwordBytes);
 
-        var loop = new int[] { iterations, 17, 17 };
-        var res = new List<byte[]> { };
+        var block = hmac.ComputeHash(salt);
+        var finalHash = new byte[block.Length];
+        Buffer.BlockCopy(block, 0, finalHash, 0, block.Length);
+
+        ReadOnlySpan<int> loops = [iterations, 17, 17];
+        var result = new List<byte[]>(3);
 
         for (var x = 0; x < 3; x++)
         {
-            for (var i = 1; i < loop[x]; i++)
+            var loopCount = loops[x];
+            for (var i = 1; i < loopCount; i++)
             {
                 block = hmac.ComputeHash(block);
+                // XOR in-place
                 for (var j = 0; j < finalHash.Length; j++)
                 {
                     finalHash[j] ^= block[j];
                 }
             }
 
-            res.Add((byte[])finalHash.Clone());
+            var hashCopy = new byte[finalHash.Length];
+            Buffer.BlockCopy(finalHash, 0, hashCopy, 0, finalHash.Length);
+            result.Add(hashCopy);
         }
 
-        return res;
+        return result;
     }
 }

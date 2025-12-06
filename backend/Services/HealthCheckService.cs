@@ -12,14 +12,13 @@ using NzbWebDAV.Utils;
 using NzbWebDAV.Websocket;
 using Serilog;
 
-// Note: Microsoft.EntityFrameworkCore is still needed for GetHealthCheckQueueItems queries
-
 namespace NzbWebDAV.Services;
 
 /// <summary>
-/// This service monitors for health checks
+/// High-performance health check monitoring service with event-driven configuration updates.
+/// Uses lock-free patterns and efficient polling with adaptive delays.
 /// </summary>
-public class HealthCheckService
+public sealed class HealthCheckService
 {
     private readonly ConfigManager _configManager;
     private readonly UsenetStreamingClient _usenetClient;
@@ -32,27 +31,31 @@ public class HealthCheckService
         concurrencyLevel: Environment.ProcessorCount,
         capacity: 1024);
 
-    public HealthCheckService
-    (
+    // Pre-computed delays for efficiency
+    private static readonly TimeSpan ShortDelay = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan IdleDelay = TimeSpan.FromSeconds(30);
+
+    public HealthCheckService(
         ConfigManager configManager,
         UsenetStreamingClient usenetClient,
-        WebsocketManager websocketManager
-    )
+        WebsocketManager websocketManager)
     {
         _configManager = configManager;
         _usenetClient = usenetClient;
         _websocketManager = websocketManager;
 
-        _configManager.OnConfigChanged += (_, configEventArgs) =>
-        {
-            // when usenet host changes, clear the missing segments cache atomically
-            if (!configEventArgs.ChangedConfig.ContainsKey("usenet.host")) return;
-            Interlocked.Exchange(ref _missingSegmentIds, new ConcurrentDictionary<string, byte>(
-                concurrencyLevel: Environment.ProcessorCount,
-                capacity: 1024));
-        };
-
+        _configManager.OnConfigChanged += OnConfigChanged;
         _ = StartMonitoringService();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void OnConfigChanged(object? sender, ConfigManager.ConfigEventArgs e)
+    {
+        // When usenet host changes, clear the missing segments cache atomically
+        if (!e.ChangedConfig.ContainsKey("usenet.host")) return;
+        Interlocked.Exchange(ref _missingSegmentIds, new ConcurrentDictionary<string, byte>(
+            concurrencyLevel: Environment.ProcessorCount,
+            capacity: 1024));
     }
 
     private async Task StartMonitoringService()
@@ -61,23 +64,23 @@ public class HealthCheckService
         {
             try
             {
-                // if the repair-job is disabled, then don't do anything
+                // Fast check if repair job is disabled
                 if (!_configManager.IsRepairJobEnabled())
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(5), _cancellationToken).ConfigureAwait(false);
+                    await Task.Delay(IdleDelay, _cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 
-                // get concurrency
+                // Get concurrency
                 var concurrency = _configManager.GetMaxRepairConnections();
 
-                // set reserved-connections context
+                // Set reserved-connections context
                 using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken);
                 var providerConfig = _configManager.GetUsenetProviderConfig();
                 var reservedConnections = providerConfig.TotalPooledConnections - concurrency;
                 using var _ = cts.Token.SetScopedContext(new ReservedPooledConnectionsContext(reservedConnections));
 
-                // get the davItem to health-check
+                // Get the davItem to health-check
                 await using var dbContext = new DavDatabaseContext();
                 var dbClient = new DavDatabaseClient(dbContext);
                 var currentDateTime = DateTimeOffset.UtcNow;
@@ -85,24 +88,29 @@ public class HealthCheckService
                     .Where(x => x.NextHealthCheck == null || x.NextHealthCheck < currentDateTime)
                     .FirstOrDefaultAsync(cts.Token).ConfigureAwait(false);
 
-                // if there is no item to health-check, don't do anything
+                // If there is no item to health-check, use longer delay
                 if (davItem == null)
                 {
-                    await Task.Delay(TimeSpan.FromSeconds(5), cts.Token).ConfigureAwait(false);
+                    await Task.Delay(IdleDelay, cts.Token).ConfigureAwait(false);
                     continue;
                 }
 
-                // perform the health check
+                // Perform the health check
                 await PerformHealthCheck(davItem, dbClient, concurrency, cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_cancellationToken.IsCancellationRequested)
+            {
+                break;
             }
             catch (Exception e)
             {
-                Log.Error(e, $"Unexpected error performing background health checks: {e.Message}");
-                await Task.Delay(TimeSpan.FromSeconds(5), _cancellationToken).ConfigureAwait(false);
+                Log.Error(e, "Unexpected error performing background health checks: {Message}", e.Message);
+                await Task.Delay(ShortDelay, _cancellationToken).ConfigureAwait(false);
             }
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static IOrderedQueryable<DavItem> GetHealthCheckQueueItems(DavDatabaseClient dbClient)
     {
         return GetHealthCheckQueueItemsQuery(dbClient)
@@ -111,9 +119,10 @@ public class HealthCheckService
             .ThenBy(x => x.Id);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static IQueryable<DavItem> GetHealthCheckQueueItemsQuery(DavDatabaseClient dbClient)
     {
-        var actionNeeded = HealthCheckResult.RepairAction.ActionNeeded;
+        const HealthCheckResult.RepairAction actionNeeded = HealthCheckResult.RepairAction.ActionNeeded;
         var healthCheckResults = dbClient.Ctx.HealthCheckResults;
         return dbClient.Ctx.Items
             .Where(x => x.Type == DavItem.ItemType.NzbFile
@@ -122,22 +131,20 @@ public class HealthCheckService
             .Where(x => !healthCheckResults.Any(h => h.DavItemId == x.Id && h.RepairStatus == actionNeeded));
     }
 
-    private async Task PerformHealthCheck
-    (
+    private async Task PerformHealthCheck(
         DavItem davItem,
         DavDatabaseClient dbClient,
         int concurrency,
-        CancellationToken ct
-    )
+        CancellationToken ct)
     {
         try
         {
-            // update the release date, if null
+            // Update the release date, if null
             var segments = await GetAllSegments(davItem, dbClient, ct).ConfigureAwait(false);
-            if (davItem.ReleaseDate == null) await UpdateReleaseDate(davItem, segments, ct).ConfigureAwait(false);
+            if (davItem.ReleaseDate == null)
+                await UpdateReleaseDate(davItem, segments, ct).ConfigureAwait(false);
 
-
-            // setup progress tracking
+            // Setup progress tracking
             var progressHook = new Progress<int>();
             var debounce = DebounceUtil.CreateDebounce(TimeSpan.FromMilliseconds(200));
             progressHook.ProgressChanged += (_, progress) =>
@@ -146,21 +153,22 @@ public class HealthCheckService
                 debounce(() => _websocketManager.SendMessage(WebsocketTopic.HealthItemProgress, message));
             };
 
-            // perform health check
+            // Perform health check
             var progress = progressHook.ToPercentage(segments.Count);
             await _usenetClient.CheckAllSegmentsAsync(segments, concurrency, progress, ct).ConfigureAwait(false);
             _ = _websocketManager.SendMessage(WebsocketTopic.HealthItemProgress, $"{davItem.Id}|100");
             _ = _websocketManager.SendMessage(WebsocketTopic.HealthItemProgress, $"{davItem.Id}|done");
 
-            // update the database
-            davItem.LastHealthCheck = DateTimeOffset.UtcNow;
-            davItem.NextHealthCheck = davItem.ReleaseDate + 2 * (davItem.LastHealthCheck - davItem.ReleaseDate);
-            dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult()
+            // Update the database
+            var utcNow = DateTimeOffset.UtcNow;
+            davItem.LastHealthCheck = utcNow;
+            davItem.NextHealthCheck = davItem.ReleaseDate + 2 * (utcNow - davItem.ReleaseDate);
+            dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult
             {
                 Id = Guid.NewGuid(),
                 DavItemId = davItem.Id,
                 Path = davItem.Path,
-                CreatedAt = DateTimeOffset.UtcNow,
+                CreatedAt = utcNow,
                 Result = HealthCheckResult.HealthResult.Healthy,
                 RepairStatus = HealthCheckResult.RepairAction.None,
                 Message = "File is healthy."
@@ -174,7 +182,7 @@ public class HealthCheckService
             if (FilenameUtil.IsImportantFileType(davItem.Name))
                 _missingSegmentIds.TryAdd(e.SegmentId, 0);
 
-            // when usenet article is missing, perform repairs
+            // When usenet article is missing, perform repairs
             await Repair(davItem, dbClient, ct).ConfigureAwait(false);
         }
     }
@@ -187,42 +195,32 @@ public class HealthCheckService
         davItem.ReleaseDate = articleHeaders.Date;
     }
 
-    private async Task<List<string>> GetAllSegments(DavItem davItem, DavDatabaseClient dbClient, CancellationToken ct)
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static async Task<List<string>> GetAllSegments(DavItem davItem, DavDatabaseClient dbClient, CancellationToken ct)
     {
-        if (davItem.Type == DavItem.ItemType.NzbFile)
+        return davItem.Type switch
         {
-            var nzbFile = await dbClient.GetNzbFileAsync(davItem.Id, ct).ConfigureAwait(false);
-            return nzbFile?.SegmentIds?.ToList() ?? [];
-        }
-
-        if (davItem.Type == DavItem.ItemType.RarFile)
-        {
-            // Use compiled query from DavDatabaseClient
-            var rarFile = await dbClient.GetRarFileAsync(davItem.Id, ct).ConfigureAwait(false);
-            return rarFile?.RarParts?.SelectMany(x => x.SegmentIds)?.ToList() ?? [];
-        }
-
-        if (davItem.Type == DavItem.ItemType.MultipartFile)
-        {
-            // Use compiled query from DavDatabaseClient
-            var multipartFile = await dbClient.GetMultipartFileAsync(davItem.Id, ct).ConfigureAwait(false);
-            return multipartFile?.Metadata?.FileParts?.SelectMany(x => x.SegmentIds)?.ToList() ?? [];
-        }
-
-        return [];
+            DavItem.ItemType.NzbFile => (await dbClient.GetNzbFileAsync(davItem.Id, ct).ConfigureAwait(false))
+                ?.SegmentIds?.ToList() ?? [],
+            DavItem.ItemType.RarFile => (await dbClient.GetRarFileAsync(davItem.Id, ct).ConfigureAwait(false))
+                ?.RarParts?.SelectMany(x => x.SegmentIds)?.ToList() ?? [],
+            DavItem.ItemType.MultipartFile => (await dbClient.GetMultipartFileAsync(davItem.Id, ct).ConfigureAwait(false))
+                ?.Metadata?.FileParts?.SelectMany(x => x.SegmentIds)?.ToList() ?? [],
+            _ => []
+        };
     }
 
     private async Task Repair(DavItem davItem, DavDatabaseClient dbClient, CancellationToken ct)
     {
         try
         {
-            // if the file extension has been marked as ignored,
-            // then don't bother trying to repair it. We can simply delete it.
+            // If the file extension has been marked as ignored, delete it
             var blacklistedExtensions = _configManager.GetBlacklistedExtensions();
-            if (blacklistedExtensions.Contains(Path.GetExtension(davItem.Name).ToLower()))
+            var extension = Path.GetExtension(davItem.Name).ToLowerInvariant();
+            if (blacklistedExtensions.Contains(extension))
             {
                 dbClient.Ctx.Items.Remove(davItem);
-                dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult()
+                dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult
                 {
                     Id = Guid.NewGuid(),
                     DavItemId = davItem.Id,
@@ -230,23 +228,18 @@ public class HealthCheckService
                     CreatedAt = DateTimeOffset.UtcNow,
                     Result = HealthCheckResult.HealthResult.Unhealthy,
                     RepairStatus = HealthCheckResult.RepairAction.Deleted,
-                    Message = string.Join(" ", [
-                        "File had missing articles.",
-                        "File extension is marked in settings as ignored (unwanted) file type.",
-                        "Deleted file."
-                    ])
+                    Message = "File had missing articles. File extension is marked in settings as ignored (unwanted) file type. Deleted file."
                 }));
                 await dbClient.Ctx.SaveChangesAsync(ct).ConfigureAwait(false);
                 return;
             }
 
-            // if the unhealthy item is unlinked/orphaned,
-            // then we can simply delete it.
+            // If the unhealthy item is unlinked/orphaned, delete it
             var symlinkOrStrmPath = OrganizedLinksUtil.GetLink(davItem, _configManager);
             if (symlinkOrStrmPath == null)
             {
                 dbClient.Ctx.Items.Remove(davItem);
-                dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult()
+                dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult
                 {
                     Id = Guid.NewGuid(),
                     DavItemId = davItem.Id,
@@ -254,30 +247,24 @@ public class HealthCheckService
                     CreatedAt = DateTimeOffset.UtcNow,
                     Result = HealthCheckResult.HealthResult.Unhealthy,
                     RepairStatus = HealthCheckResult.RepairAction.Deleted,
-                    Message = string.Join(" ", [
-                        "File had missing articles.",
-                        "Could not find corresponding symlink or strm-file within Library Dir.",
-                        "Deleted file."
-                    ])
+                    Message = "File had missing articles. Could not find corresponding symlink or strm-file within Library Dir. Deleted file."
                 }));
                 await dbClient.Ctx.SaveChangesAsync(ct).ConfigureAwait(false);
                 return;
             }
 
-            // if the unhealthy item is linked within the organized media-library
-            // then we must find the corresponding arr instance and trigger a new search.
-            var linkType = symlinkOrStrmPath.ToLower().EndsWith("strm") ? "strm-file" : "symlink";
+            // If the unhealthy item is linked, find the corresponding arr instance and trigger a new search
+            var linkType = symlinkOrStrmPath.EndsWith(".strm", StringComparison.OrdinalIgnoreCase) ? "strm-file" : "symlink";
             foreach (var arrClient in _configManager.GetArrConfig().GetArrClients())
             {
                 var rootFolders = await arrClient.GetRootFolders().ConfigureAwait(false);
-                if (!rootFolders.Any(x => symlinkOrStrmPath.StartsWith(x.Path!))) continue;
+                if (!rootFolders.Any(x => symlinkOrStrmPath.StartsWith(x.Path!, StringComparison.Ordinal))) continue;
 
-                // if we found a corresponding arr instance,
-                // then remove and search.
+                // If we found a corresponding arr instance, remove and search
                 if (await arrClient.RemoveAndSearch(symlinkOrStrmPath).ConfigureAwait(false))
                 {
                     dbClient.Ctx.Items.Remove(davItem);
-                    dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult()
+                    dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult
                     {
                         Id = Guid.NewGuid(),
                         DavItemId = davItem.Id,
@@ -285,28 +272,19 @@ public class HealthCheckService
                         CreatedAt = DateTimeOffset.UtcNow,
                         Result = HealthCheckResult.HealthResult.Unhealthy,
                         RepairStatus = HealthCheckResult.RepairAction.Repaired,
-                        Message = string.Join(" ", [
-                            "File had missing articles.",
-                            $"Corresponding {linkType} found within Library Dir.",
-                            "Triggered new Arr search."
-                        ])
+                        Message = $"File had missing articles. Corresponding {linkType} found within Library Dir. Triggered new Arr search."
                     }));
                     await dbClient.Ctx.SaveChangesAsync(ct).ConfigureAwait(false);
                     return;
                 }
 
-                // if we could not find corresponding media-item to remove-and-search
-                // within the found arr instance, then break out of this loop so that
-                // we can fall back to the behavior below of deleting both the link-file
-                // and the dav-item.
                 break;
             }
 
-            // if we could not find a corresponding arr instance
-            // then we can delete both the item and the link-file.
-            await Task.Run(() => File.Delete(symlinkOrStrmPath)).ConfigureAwait(false);
+            // If we could not find a corresponding arr instance, delete both the item and the link-file
+            await Task.Run(() => File.Delete(symlinkOrStrmPath), ct).ConfigureAwait(false);
             dbClient.Ctx.Items.Remove(davItem);
-            dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult()
+            dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult
             {
                 Id = Guid.NewGuid(),
                 DavItemId = davItem.Id,
@@ -314,23 +292,17 @@ public class HealthCheckService
                 CreatedAt = DateTimeOffset.UtcNow,
                 Result = HealthCheckResult.HealthResult.Unhealthy,
                 RepairStatus = HealthCheckResult.RepairAction.Deleted,
-                Message = string.Join(" ", [
-                    "File had missing articles.",
-                    $"Corresponding {linkType} found within Library Dir.",
-                    "Could not find corresponding Radarr/Sonarr media-item to trigger a new search.",
-                    $"Deleted the webdav-file and {linkType}."
-                ])
+                Message = $"File had missing articles. Corresponding {linkType} found within Library Dir. Could not find corresponding Radarr/Sonarr media-item to trigger a new search. Deleted the webdav-file and {linkType}."
             }));
             await dbClient.Ctx.SaveChangesAsync(ct).ConfigureAwait(false);
         }
         catch (Exception e)
         {
-            // if an error is encountered during repairs,
-            // then mark the item as unhealthy
+            // If an error is encountered during repairs, mark the item as unhealthy
             var utcNow = DateTimeOffset.UtcNow;
             davItem.LastHealthCheck = utcNow;
             davItem.NextHealthCheck = null;
-            dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult()
+            dbClient.Ctx.HealthCheckResults.Add(SendStatus(new HealthCheckResult
             {
                 Id = Guid.NewGuid(),
                 DavItemId = davItem.Id,
@@ -344,10 +316,10 @@ public class HealthCheckService
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private HealthCheckResult SendStatus(HealthCheckResult result)
     {
-        _ = _websocketManager.SendMessage
-        (
+        _ = _websocketManager.SendMessage(
             WebsocketTopic.HealthItemStatus,
             $"{result.DavItemId}|{(int)result.Result}|{(int)result.RepairStatus}"
         );

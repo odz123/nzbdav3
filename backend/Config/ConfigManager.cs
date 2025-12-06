@@ -1,4 +1,6 @@
-﻿using System.Text.Json;
+﻿using System.Collections.Frozen;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
@@ -6,33 +8,49 @@ using NzbWebDAV.Utils;
 
 namespace NzbWebDAV.Config;
 
-public class ConfigManager
+/// <summary>
+/// High-performance configuration manager with lock-free reads.
+/// Uses immutable frozen dictionary snapshots for thread-safe access without locking.
+/// </summary>
+public sealed class ConfigManager
 {
-    private readonly Dictionary<string, string> _config = new();
+    // Immutable snapshot of configuration - replaced atomically on updates
+    // FrozenDictionary provides faster lookups than regular Dictionary
+    private volatile FrozenDictionary<string, string> _configSnapshot = FrozenDictionary<string, string>.Empty;
+
+    // Lock only used for writes (rare operation)
+    private readonly object _writeLock = new();
+
     public event EventHandler<ConfigEventArgs>? OnConfigChanged;
 
     public async Task LoadConfig()
     {
         await using var dbContext = new DavDatabaseContext();
-        var configItems = await dbContext.ConfigItems.ToListAsync().ConfigureAwait(false);
-        lock (_config)
+        // Use projection to avoid loading full entities
+        var configItems = await dbContext.ConfigItems
+            .Select(x => new { x.ConfigName, x.ConfigValue })
+            .ToListAsync()
+            .ConfigureAwait(false);
+
+        var newConfig = configItems.ToDictionary(x => x.ConfigName, x => x.ConfigValue);
+
+        lock (_writeLock)
         {
-            _config.Clear();
-            foreach (var configItem in configItems)
-            {
-                _config[configItem.ConfigName] = configItem.ConfigValue;
-            }
+            _configSnapshot = newConfig.ToFrozenDictionary();
         }
     }
 
+    /// <summary>
+    /// Gets a configuration value. Lock-free read using immutable snapshot.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string? GetConfigValue(string configName)
     {
-        lock (_config)
-        {
-            return _config.TryGetValue(configName, out string? value) ? value : null;
-        }
+        // Lock-free read - volatile ensures we see the latest snapshot
+        return _configSnapshot.TryGetValue(configName, out var value) ? value : null;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public T? GetConfigValue<T>(string configName)
     {
         var rawValue = StringUtil.EmptyToNull(GetConfigValue(configName));
@@ -41,24 +59,32 @@ public class ConfigManager
 
     public void UpdateValues(List<ConfigItem> configItems)
     {
-        ConfigEventArgs? eventArgs = null;
-        lock (_config)
+        ConfigEventArgs? eventArgs;
+
+        lock (_writeLock)
         {
+            // Create mutable copy, update, then freeze
+            var mutableConfig = _configSnapshot.ToDictionary(x => x.Key, x => x.Value);
             foreach (var configItem in configItems)
             {
-                _config[configItem.ConfigName] = configItem.ConfigValue;
+                mutableConfig[configItem.ConfigName] = configItem.ConfigValue;
             }
 
             eventArgs = new ConfigEventArgs
             {
                 ChangedConfig = configItems.ToDictionary(x => x.ConfigName, x => x.ConfigValue),
-                NewConfig = new Dictionary<string, string>(_config)
+                NewConfig = new Dictionary<string, string>(mutableConfig)
             };
+
+            // Atomically replace with new immutable snapshot
+            _configSnapshot = mutableConfig.ToFrozenDictionary();
         }
+
         // Invoke event outside the lock to prevent potential deadlocks
         OnConfigChanged?.Invoke(this, eventArgs);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetRcloneMountDir()
     {
         var mountDir = StringUtil.EmptyToNull(GetConfigValue("rclone.mount-dir"))
@@ -68,18 +94,21 @@ public class ConfigManager
         return mountDir;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetApiKey()
     {
         return StringUtil.EmptyToNull(GetConfigValue("api.key"))
                ?? EnvironmentUtil.GetVariable("FRONTEND_BACKEND_API_KEY");
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetStrmKey()
     {
         return GetConfigValue("api.strm-key")
                ?? throw new InvalidOperationException("The `api.strm-key` config does not exist.");
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetApiCategories()
     {
         return StringUtil.EmptyToNull(GetConfigValue("api.categories"))
@@ -87,12 +116,14 @@ public class ConfigManager
                ?? "audio,software,tv,movies";
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetManualUploadCategory()
     {
         return StringUtil.EmptyToNull(GetConfigValue("api.manual-category"))
                ?? "uncategorized";
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int GetConnectionsPerStream()
     {
         return int.Parse(
@@ -102,6 +133,7 @@ public class ConfigManager
         );
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string? GetWebdavUser()
     {
         return StringUtil.EmptyToNull(GetConfigValue("webdav.user"))
@@ -109,6 +141,7 @@ public class ConfigManager
                ?? "admin";
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string? GetWebdavPasswordHash()
     {
         var hashedPass = StringUtil.EmptyToNull(GetConfigValue("webdav.pass"));
@@ -118,25 +151,27 @@ public class ConfigManager
         return null;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsEnsureImportableVideoEnabled()
     {
-        var defaultValue = true;
         var configValue = StringUtil.EmptyToNull(GetConfigValue("api.ensure-importable-video"));
-        return (configValue != null ? bool.Parse(configValue) : defaultValue);
+        return configValue != null ? bool.Parse(configValue) : true;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool ShowHiddenWebdavFiles()
     {
-        var defaultValue = false;
         var configValue = StringUtil.EmptyToNull(GetConfigValue("webdav.show-hidden-files"));
-        return (configValue != null ? bool.Parse(configValue) : defaultValue);
+        return configValue != null && bool.Parse(configValue);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string? GetLibraryDir()
     {
         return StringUtil.EmptyToNull(GetConfigValue("media.library-dir"));
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int GetMaxQueueConnections()
     {
         return int.Parse(
@@ -145,34 +180,35 @@ public class ConfigManager
         );
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsEnforceReadonlyWebdavEnabled()
     {
-        var defaultValue = true;
         var configValue = StringUtil.EmptyToNull(GetConfigValue("webdav.enforce-readonly"));
-        return (configValue != null ? bool.Parse(configValue) : defaultValue);
+        return configValue == null || bool.Parse(configValue);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsEnsureArticleExistenceEnabled()
     {
-        var defaultValue = false;
         var configValue = StringUtil.EmptyToNull(GetConfigValue("api.ensure-article-existence"));
-        return (configValue != null ? bool.Parse(configValue) : defaultValue);
+        return configValue != null && bool.Parse(configValue);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsPreviewPar2FilesEnabled()
     {
-        var defaultValue = false;
         var configValue = StringUtil.EmptyToNull(GetConfigValue("webdav.preview-par2-files"));
-        return (configValue != null ? bool.Parse(configValue) : defaultValue);
+        return configValue != null && bool.Parse(configValue);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsIgnoreSabHistoryLimitEnabled()
     {
-        var defaultValue = true;
         var configValue = StringUtil.EmptyToNull(GetConfigValue("api.ignore-history-limit"));
-        return (configValue != null ? bool.Parse(configValue) : defaultValue);
+        return configValue == null || bool.Parse(configValue);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int GetMaxRepairConnections()
     {
         return int.Parse(
@@ -181,33 +217,33 @@ public class ConfigManager
         );
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsRepairJobEnabled()
     {
-        var defaultValue = false;
         var configValue = StringUtil.EmptyToNull(GetConfigValue("repair.enable"));
-        var isRepairJobEnabled = (configValue != null ? bool.Parse(configValue) : defaultValue);
+        var isRepairJobEnabled = configValue != null && bool.Parse(configValue);
         return isRepairJobEnabled
                && GetMaxRepairConnections() > 0
                && GetLibraryDir() != null
                && GetArrConfig().GetInstanceCount() > 0;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public ArrConfig GetArrConfig()
     {
-        var defaultValue = new ArrConfig();
-        return GetConfigValue<ArrConfig>("arr.instances") ?? defaultValue;
+        return GetConfigValue<ArrConfig>("arr.instances") ?? new ArrConfig();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public UsenetProviderConfig GetUsenetProviderConfig()
     {
-        var defaultValue = new UsenetProviderConfig();
-        return GetConfigValue<UsenetProviderConfig>("usenet.providers") ?? defaultValue;
+        return GetConfigValue<UsenetProviderConfig>("usenet.providers") ?? new UsenetProviderConfig();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetDuplicateNzbBehavior()
     {
-        var defaultValue = "increment";
-        return GetConfigValue("api.duplicate-nzb-behavior") ?? defaultValue;
+        return GetConfigValue("api.duplicate-nzb-behavior") ?? "increment";
     }
 
     public HashSet<string> GetBlacklistedExtensions()
@@ -221,24 +257,27 @@ public class ConfigManager
             .ToHashSet();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetImportStrategy()
     {
         return GetConfigValue("api.import-strategy") ?? "symlinks";
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetStrmCompletedDownloadDir()
     {
         return GetConfigValue("api.completed-downloads-dir") ?? "/data/completed-downloads";
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public string GetBaseUrl()
     {
         return GetConfigValue("general.base-url") ?? "http://localhost:3000";
     }
 
-    public class ConfigEventArgs : EventArgs
+    public sealed class ConfigEventArgs : EventArgs
     {
-        public Dictionary<string, string> ChangedConfig { get; set; } = new();
-        public Dictionary<string, string> NewConfig { get; set; } = new();
+        public Dictionary<string, string> ChangedConfig { get; init; } = new();
+        public Dictionary<string, string> NewConfig { get; init; } = new();
     }
 }
