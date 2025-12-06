@@ -4,92 +4,147 @@ using NzbWebDAV.Models;
 
 namespace NzbWebDAV.Utils;
 
+/// <summary>
+/// High-performance interpolation search for finding byte positions in segmented files.
+/// Uses interpolation (estimation based on uniform distribution) for O(log log n) average case.
+/// </summary>
 public static class InterpolationSearch
 {
-    public static Result Find
-    (
+    // Pre-allocated exception message to avoid string allocation on hot path
+    private const string CorruptFileMessage = "Corrupt file. Cannot find byte position.";
+
+    /// <summary>
+    /// Synchronous version for cases where the range lookup is synchronous.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Result Find(
         long searchByte,
         LongRange indexRangeToSearch,
         LongRange byteRangeToSearch,
-        Func<int, LongRange> getByteRangeOfGuessedIndex
-    )
+        Func<int, LongRange> getByteRangeOfGuessedIndex)
     {
         return Find(
             searchByte,
             indexRangeToSearch,
             byteRangeToSearch,
             guess => new ValueTask<LongRange>(getByteRangeOfGuessedIndex(guess)),
-            SigtermUtil.GetCancellationToken()
+            CancellationToken.None
         ).GetAwaiter().GetResult();
     }
 
+    /// <summary>
+    /// Asynchronous interpolation search with ValueTask support for minimal allocations.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Task<Result> Find
-    (
+    public static Task<Result> Find(
         long searchByte,
         LongRange indexRangeToSearch,
         LongRange byteRangeToSearch,
         Func<int, ValueTask<LongRange>> getByteRangeOfGuessedIndex,
-        CancellationToken cancellationToken
-    )
+        CancellationToken cancellationToken)
     {
-        // Fast path: single index - no search needed
+        // Fast path: single index - no search needed, avoid async overhead
         if (indexRangeToSearch.Count == 1)
         {
             if (!byteRangeToSearch.Contains(searchByte))
-                throw new SeekPositionNotFoundException($"Corrupt file. Cannot find byte position {searchByte}.");
+                ThrowCorruptFile(searchByte);
             return Task.FromResult(new Result((int)indexRangeToSearch.StartInclusive, byteRangeToSearch));
         }
 
-        return FindCore(searchByte, indexRangeToSearch, byteRangeToSearch, getByteRangeOfGuessedIndex, cancellationToken);
+        // Fast path: two indices - simple binary choice
+        if (indexRangeToSearch.Count == 2)
+        {
+            return FindBinaryAsync(searchByte, indexRangeToSearch, byteRangeToSearch, getByteRangeOfGuessedIndex, cancellationToken);
+        }
+
+        return FindCoreAsync(searchByte, indexRangeToSearch, byteRangeToSearch, getByteRangeOfGuessedIndex, cancellationToken);
     }
 
-    private static async Task<Result> FindCore
-    (
+    /// <summary>
+    /// Optimized path for binary search (2 elements).
+    /// </summary>
+    private static async Task<Result> FindBinaryAsync(
         long searchByte,
         LongRange indexRangeToSearch,
         LongRange byteRangeToSearch,
         Func<int, ValueTask<LongRange>> getByteRangeOfGuessedIndex,
-        CancellationToken cancellationToken
-    )
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var firstIndex = (int)indexRangeToSearch.StartInclusive;
+        var firstRange = await getByteRangeOfGuessedIndex(firstIndex).ConfigureAwait(false);
+
+        if (firstRange.Contains(searchByte))
+            return new Result(firstIndex, firstRange);
+
+        var secondIndex = firstIndex + 1;
+        var secondRange = await getByteRangeOfGuessedIndex(secondIndex).ConfigureAwait(false);
+
+        if (secondRange.Contains(searchByte))
+            return new Result(secondIndex, secondRange);
+
+        ThrowCorruptFile(searchByte);
+        return default; // Never reached
+    }
+
+    private static async Task<Result> FindCoreAsync(
+        long searchByte,
+        LongRange indexRangeToSearch,
+        LongRange byteRangeToSearch,
+        Func<int, ValueTask<LongRange>> getByteRangeOfGuessedIndex,
+        CancellationToken cancellationToken)
+    {
+        // Local copies for mutation
+        var indexRange = indexRangeToSearch;
+        var byteRange = byteRangeToSearch;
+
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // make sure our search is even possible.
-            if (!byteRangeToSearch.Contains(searchByte) || indexRangeToSearch.Count <= 0)
-                throw new SeekPositionNotFoundException($"Corrupt file. Cannot find byte position {searchByte}.");
+            // Validate search is possible
+            if (!byteRange.Contains(searchByte) || indexRange.Count <= 0)
+                ThrowCorruptFile(searchByte);
 
-            // make a guess using interpolation
-            var searchByteFromStart = searchByte - byteRangeToSearch.StartInclusive;
-            var bytesPerIndex = (double)byteRangeToSearch.Count / indexRangeToSearch.Count;
-            var guessFromStart = (long)Math.Floor(searchByteFromStart / bytesPerIndex);
-            var guessedIndex = (int)(indexRangeToSearch.StartInclusive + guessFromStart);
-            var byteRangeOfGuessedIndex = await getByteRangeOfGuessedIndex(guessedIndex).ConfigureAwait(false);
+            // Interpolation guess - estimate position based on uniform distribution
+            var searchByteFromStart = searchByte - byteRange.StartInclusive;
+            var bytesPerIndex = (double)byteRange.Count / indexRange.Count;
+            var guessFromStart = (long)(searchByteFromStart / bytesPerIndex);
+            var guessedIndex = (int)(indexRange.StartInclusive + guessFromStart);
 
-            // make sure the result is within the range of our search space
-            if (!byteRangeOfGuessedIndex.IsContainedWithin(byteRangeToSearch))
-                throw new SeekPositionNotFoundException($"Corrupt file. Cannot find byte position {searchByte}.");
+            // Clamp guess to valid range (handles edge cases)
+            guessedIndex = Math.Clamp(guessedIndex, (int)indexRange.StartInclusive, (int)indexRange.EndExclusive - 1);
 
-            // if we guessed too low, adjust our lower bounds in order to search higher next time
-            if (byteRangeOfGuessedIndex.EndExclusive <= searchByte)
+            var guessedRange = await getByteRangeOfGuessedIndex(guessedIndex).ConfigureAwait(false);
+
+            // Validate result is within search space
+            if (!guessedRange.IsContainedWithin(byteRange))
+                ThrowCorruptFile(searchByte);
+
+            // Found it
+            if (guessedRange.Contains(searchByte))
+                return new Result(guessedIndex, guessedRange);
+
+            // Guessed too low - search higher
+            if (guessedRange.EndExclusive <= searchByte)
             {
-                indexRangeToSearch = indexRangeToSearch with { StartInclusive = guessedIndex + 1 };
-                byteRangeToSearch = byteRangeToSearch with { StartInclusive = byteRangeOfGuessedIndex.EndExclusive };
+                indexRange = new LongRange(guessedIndex + 1, indexRange.EndExclusive);
+                byteRange = new LongRange(guessedRange.EndExclusive, byteRange.EndExclusive);
             }
-
-            // if we guessed too high, adjust our upper bounds in order to search lower next time
-            else if (byteRangeOfGuessedIndex.StartInclusive > searchByte)
+            // Guessed too high - search lower
+            else
             {
-                indexRangeToSearch = indexRangeToSearch with { EndExclusive = guessedIndex };
-                byteRangeToSearch = byteRangeToSearch with { EndExclusive = byteRangeOfGuessedIndex.StartInclusive };
+                indexRange = new LongRange(indexRange.StartInclusive, guessedIndex);
+                byteRange = new LongRange(byteRange.StartInclusive, guessedRange.StartInclusive);
             }
-
-            // if we guessed correctly, we're done
-            else if (byteRangeOfGuessedIndex.Contains(searchByte))
-                return new Result(guessedIndex, byteRangeOfGuessedIndex);
         }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowCorruptFile(long searchByte)
+    {
+        throw new SeekPositionNotFoundException($"{CorruptFileMessage} Position: {searchByte}");
     }
 
     /// <summary>
